@@ -291,6 +291,129 @@ async fn verification_replaces_contact_only_after_user_bound_one_time_proof() {
 }
 
 #[tokio::test]
+async fn large_notice_catchup_does_not_block_contact_verification() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user_id = format!("contact-large-catchup-{}", uuid::Uuid::new_v4());
+    let destination = format!("catchup-{}@example.test", uuid::Uuid::new_v4());
+    seed_user(&pool, &user_id).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    for index in 0..101 {
+        notifications::enqueue(
+            &pool,
+            &notifications::NoticeIntent {
+                recipient_user_id: user_id.clone(),
+                event_key: format!("catchup-overflow-{index}"),
+                policy_key: "catchup-overflow-v1".into(),
+                kind: notifications::NoticeKind::CheckoutOutcome,
+                channel: notifications::NoticeChannel::InApp,
+                contact_id: None,
+                scope_id: None,
+                due_at_epoch: now_epoch - index,
+                content: notifications::NoticeContent {
+                    title: "A recent Cloud update".into(),
+                    detail: "Review your Cloud account for this update.".into(),
+                    effective_at_epoch: None,
+                    deadline_epoch: None,
+                    amount_pence: None,
+                    price_interval: None,
+                },
+            },
+        )
+        .await
+        .expect("enqueue recent in-app notice");
+    }
+
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let service = service(
+        pool.clone(),
+        messages.clone(),
+        SendOutcome::Accepted {
+            provider_message_id: format!("provider-{}", uuid::Uuid::new_v4()),
+        },
+    );
+    contact_verification::start_verification(
+        &pool,
+        &service,
+        &user_id,
+        StartVerificationRequest {
+            email: destination.clone(),
+            idempotency_key: format!("large-catchup:{}", uuid::Uuid::new_v4()),
+        },
+    )
+    .await
+    .expect("start verification despite a large notice history");
+    wait_for_completed_sends(&pool, &user_id, 1).await;
+    let token = {
+        let sent = messages.lock().expect("message lock");
+        url::Url::parse(&sent[0].verification_url)
+            .expect("verification URL")
+            .fragment()
+            .and_then(|fragment| fragment.strip_prefix("contact_token="))
+            .expect("token fragment")
+            .to_owned()
+    };
+
+    assert!(
+        contact_verification::confirm_verification(&pool, &user_id, &token)
+            .await
+            .expect("verification must commit even when the notice catch-up is capped")
+    );
+    assert_eq!(
+        contact_verification::contact_status(&pool, &user_id)
+            .await
+            .expect("verified contact status")
+            .email
+            .expect("verified email is active")
+            .masked_destination,
+        "c***@example.test"
+    );
+    let caught_up: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND channel='email' AND policy_key='catchup-overflow-v1'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count bounded email catch-up");
+    assert_eq!(caught_up, 100);
+
+    sqlx::query("DELETE FROM cloud_notice_outbox WHERE recipient_user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean catch-up notices");
+    sqlx::query(
+        "DELETE FROM cloud_contact_verification_send_attempts WHERE challenge_id IN ( \
+         SELECT challenge_id FROM cloud_contact_verification_challenges WHERE user_id=$1)",
+    )
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("clean verification attempts");
+    sqlx::query("DELETE FROM cloud_contact_verification_challenges WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean verification challenges");
+    sqlx::query("DELETE FROM cloud_verified_contacts WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean verified contacts");
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean test user");
+}
+
+#[tokio::test]
 async fn resend_is_idempotent_and_unknown_delivery_remains_confirmable() {
     let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {

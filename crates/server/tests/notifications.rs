@@ -194,6 +194,83 @@ fn in_app_intent(user_id: &str, event_key: &str, due_at_epoch: i64) -> NoticeInt
 }
 
 #[tokio::test]
+async fn recovery_warning_is_queued_three_days_before_the_recovery_deadline() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-recovery-warning";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    let paid_until = now_epoch - 2 * 24 * 60 * 60;
+    let recovery_until = paid_until + sotto_server::cloud_coverage::RENEWAL_RECOVERY_SECONDS;
+    let interval = ConfirmedPaidInterval {
+        coverage_id: "recovery-warning-paid-term".into(),
+        source_id: "recovery-warning-source".into(),
+        starts_at: paid_until - 30 * 24 * 60 * 60,
+        paid_until,
+        failed_renewal_id: Some("recovery-warning-failed-renewal".into()),
+    };
+    let revision = publish_coverage(
+        &pool,
+        USER_ID,
+        None,
+        "recovery-warning-projection",
+        vec![interval.clone()],
+    )
+    .await;
+    let view = eligibility_for(
+        PersonCoverage {
+            beneficiary_id: USER_ID.into(),
+            paid_intervals: vec![interval],
+        },
+        now_epoch,
+    );
+    assert_eq!(
+        view.state,
+        sotto_server::person_eligibility::EligibilityState::RenewalRecovery
+    );
+
+    assert!(notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &view,
+        Some(revision),
+        now_epoch,
+    )
+    .await
+    .expect("queue the recovery warning"));
+    let warning = sqlx::query(
+        "SELECT extract(epoch FROM due_at)::bigint AS due_at, \
+                payload->>'title' AS title, (payload->>'deadline_epoch')::bigint AS deadline \
+         FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+           AND kind='recovery_end' AND channel='in_app' AND status='pending'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load scheduled recovery warning");
+    assert_eq!(
+        warning.get::<i64, _>("due_at"),
+        recovery_until - notifications::RECOVERY_END_NOTICE_LEAD_SECONDS
+    );
+    assert_eq!(
+        warning.get::<String, _>("title"),
+        "Your Cloud recovery period is ending soon"
+    );
+    assert_eq!(warning.get::<i64, _>("deadline"), recovery_until);
+    assert!(notifications::list_for_user(&pool, USER_ID)
+        .await
+        .expect("list notices before the warning is due")
+        .is_empty());
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
 async fn export_window_notice_tracks_the_complete_coverage_episode() {
     let _guard = notification_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {

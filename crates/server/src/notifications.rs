@@ -32,6 +32,7 @@ const MAX_DETAIL: usize = 2_000;
 const MAX_NOTICES: i64 = 100;
 const MAX_NOTICES_PER_WORKER_TICK: usize = 20;
 pub const STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS: i64 = 60 * 24 * 60 * 60;
+pub const RECOVERY_END_NOTICE_LEAD_SECONDS: i64 = 3 * 24 * 60 * 60;
 pub(crate) const EXPORT_DEADLINE_POLICY_KEY: &str = "cloud-export-deadline-v1";
 type NoticeResult<T> = std::result::Result<T, NoticeError>;
 
@@ -407,16 +408,11 @@ pub async fn enqueue_sponsorship_change_in_tx(
          JOIN organizations organization ON organization.id=membership.org_id \
          WHERE membership.org_id=$1 AND membership.role IN ('owner','admin') \
            AND organization.lifecycle_state='active' \
-         ORDER BY membership.user_id COLLATE \"C\" LIMIT 129",
+         ORDER BY membership.user_id COLLATE \"C\" LIMIT 128",
     )
     .bind(&organization_id)
     .fetch_all(&mut **tx)
     .await?;
-    if administrators.len() > 128 {
-        return Err(NoticeError::InvalidContent(
-            "sponsorship notice scope exceeded its bound",
-        ));
-    }
     recipients.extend(administrators);
     let (title, detail) = match action.as_str() {
         "add" => (
@@ -551,8 +547,9 @@ async fn insert_intent_in_tx(
 }
 
 /// Queue a bounded catch-up for notices that are scheduled for the future or were created within
-/// the fixed export-window horizon. Every message keeps the original event identity and due date;
-/// the dispatcher rechecks current authority before sending.
+/// the fixed export-window horizon. At most `MAX_NOTICES` are copied, with the earliest due items
+/// first, so a large backlog cannot block contact verification. Every message keeps the original
+/// event identity and due date; the dispatcher rechecks current authority before sending.
 pub async fn enqueue_current_for_verified_contact_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     recipient_user_id: &str,
@@ -584,14 +581,9 @@ pub async fn enqueue_current_for_verified_contact_in_tx(
          ORDER BY notice.due_at, notice.created_at, notice.notice_id LIMIT $2",
     )
     .bind(recipient_user_id)
-    .bind(MAX_NOTICES + 1)
+    .bind(MAX_NOTICES)
     .fetch_all(&mut **tx)
     .await?;
-    if rows.len() > MAX_NOTICES as usize {
-        return Err(NoticeError::InvalidContent(
-            "verified-contact notice catch-up exceeded its bound",
-        ));
-    }
     let mut queued = 0;
     for row in rows {
         let kind = notice_kind_from_str(&row.try_get::<String, _>("kind")?)
@@ -771,24 +763,29 @@ pub async fn reconcile_export_deadline_notice(
         None
     };
     let recovery_end_intent = if view.state == EligibilityState::RenewalRecovery {
-        view.recovery_until_epoch.map(|effective_at| NoticeIntent {
-            recipient_user_id: recipient_user_id.to_owned(),
-            event_key: format!("cloud-recovery-end:{effective_at}"),
-            policy_key: "cloud-recovery-end-v1".to_owned(),
-            kind: NoticeKind::RecoveryEnd,
-            channel: NoticeChannel::InApp,
-            contact_id: None,
-            scope_id: None,
-            due_at_epoch: effective_at,
-            content: NoticeContent {
-                title: "Your Cloud recovery period is ending".into(),
-                detail: "Your renewal is still unresolved. Resolve billing before this date to keep Cloud coverage active.".into(),
-                effective_at_epoch: Some(effective_at),
-                deadline_epoch: notice_window.map(|(_, deadline)| deadline),
-                amount_pence: None,
-                price_interval: None,
-            },
-        })
+        view.recovery_until_epoch
+            .map(|recovery_until| {
+                let due_at = recovery_end_notice_due_at(recovery_until)?;
+                Ok::<NoticeIntent, NoticeError>(NoticeIntent {
+                    recipient_user_id: recipient_user_id.to_owned(),
+                    event_key: format!("cloud-recovery-end:{recovery_until}"),
+                    policy_key: "cloud-recovery-end-v1".to_owned(),
+                    kind: NoticeKind::RecoveryEnd,
+                    channel: NoticeChannel::InApp,
+                    contact_id: None,
+                    scope_id: None,
+                    due_at_epoch: due_at,
+                    content: NoticeContent {
+                        title: "Your Cloud recovery period is ending soon".into(),
+                        detail: "Your renewal is still unresolved. Resolve billing by the displayed date to keep Cloud coverage active.".into(),
+                        effective_at_epoch: None,
+                        deadline_epoch: Some(recovery_until),
+                        amount_pence: None,
+                        price_interval: None,
+                    },
+                })
+            })
+            .transpose()?
     } else {
         None
     };
@@ -1924,8 +1921,7 @@ async fn notice_is_current(pool: &PgPool, lease: &NoticeLease) -> NoticeResult<O
         };
         let current = match lease.kind.as_str() {
             "recovery_end" => {
-                decision.state == crate::cloud_coverage::CoverageState::ExportOnly
-                    && decision.export_until == lease.content.deadline_epoch
+                recovery_end_notice_is_current(decision, lease.content.deadline_epoch)
             }
             "export_deadline" => {
                 decision.state == crate::cloud_coverage::CoverageState::ExportOnly
@@ -1936,6 +1932,25 @@ async fn notice_is_current(pool: &PgPool, lease: &NoticeLease) -> NoticeResult<O
         return Ok(Some(current));
     }
     Ok(Some(true))
+}
+
+fn recovery_end_notice_is_current(
+    decision: crate::cloud_coverage::CoverageDecision,
+    expected_recovery_until: Option<i64>,
+) -> bool {
+    expected_recovery_until.is_some_and(|expected| {
+        decision.state == crate::cloud_coverage::CoverageState::RenewalRecovery
+            && decision.recovery_until == Some(expected)
+    })
+}
+
+pub fn recovery_end_notice_due_at(recovery_until_epoch: i64) -> NoticeResult<i64> {
+    recovery_until_epoch
+        .checked_sub(RECOVERY_END_NOTICE_LEAD_SECONDS)
+        .filter(|due_at| *due_at > 0)
+        .ok_or(NoticeError::InvalidContent(
+            "recovery warning date is out of range",
+        ))
 }
 
 async fn record_acceptance(
@@ -2229,6 +2244,51 @@ mod tests {
             Err(NoticeError::InvalidContent(
                 "price change notice would be due before the epoch"
             ))
+        ));
+    }
+
+    #[test]
+    fn recovery_warning_is_due_three_days_before_its_deadline() {
+        let recovery_until = 2_000_000_000;
+        assert_eq!(
+            recovery_end_notice_due_at(recovery_until).unwrap(),
+            recovery_until - RECOVERY_END_NOTICE_LEAD_SECONDS
+        );
+        assert!(matches!(
+            recovery_end_notice_due_at(RECOVERY_END_NOTICE_LEAD_SECONDS),
+            Err(NoticeError::InvalidContent(
+                "recovery warning date is out of range"
+            ))
+        ));
+    }
+
+    #[test]
+    fn recovery_warning_is_current_only_during_the_matching_recovery_period() {
+        let recovery_until = 2_000_000_000;
+        let recovering = crate::cloud_coverage::CoverageDecision {
+            state: crate::cloud_coverage::CoverageState::RenewalRecovery,
+            active_until: Some(recovery_until),
+            recovery_until: Some(recovery_until),
+            export_until: None,
+        };
+        assert!(recovery_end_notice_is_current(
+            recovering,
+            Some(recovery_until)
+        ));
+        assert!(!recovery_end_notice_is_current(
+            recovering,
+            Some(recovery_until + 1)
+        ));
+
+        let export_only = crate::cloud_coverage::CoverageDecision {
+            state: crate::cloud_coverage::CoverageState::ExportOnly,
+            active_until: None,
+            recovery_until: None,
+            export_until: Some(recovery_until + EXPORT_WINDOW_SECONDS),
+        };
+        assert!(!recovery_end_notice_is_current(
+            export_only,
+            Some(recovery_until)
         ));
     }
 

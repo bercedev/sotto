@@ -265,7 +265,7 @@ fn notice_subject(kind: &str) -> Option<&'static str> {
         "failed_renewal" | "sponsored_renewal_failure" | "sponsored_renewal_action" => {
             "Action needed for Sotto Cloud billing"
         }
-        "recovery_end" => "Your Sotto Cloud recovery period is ending",
+        "recovery_end" => "Your Sotto Cloud recovery period is ending soon",
         "export_deadline" => "Your Sotto Cloud export deadline",
         "sponsorship_change" => "Your Sotto Cloud sponsorship changed",
         "payer_transfer_invitation" => "Sotto Cloud payer transfer request",
