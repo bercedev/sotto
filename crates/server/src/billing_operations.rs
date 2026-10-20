@@ -201,6 +201,13 @@ pub struct BillingOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredPersonalCheckout {
+    pub operation_id: String,
+    pub session_id: String,
+    pub lease_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginOperation {
     Created(BillingOperation),
     AlreadyExists(BillingOperation),
@@ -608,13 +615,19 @@ pub async fn record_checkout_expired(
         let existing = load_operation(tx, operation_id).await?;
         if existing.state == BillingOperationState::Succeeded
             && existing.result_code.as_deref() == Some("checkout_created")
-            && existing.provider_checkout_session_id.as_deref() == Some(session_id)
+            && existing
+                .provider_checkout_session_id
+                .as_deref()
+                .is_none_or(|stored| stored == session_id)
+            && existing.provider_operation_id.as_deref() == Some(session_id)
         {
             sqlx::query(
                 "UPDATE billing_operations SET state = 'failed', result_code = 'checkout_expired', \
+                 provider_checkout_session_id = COALESCE(provider_checkout_session_id, $2), \
                  reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
                  WHERE operation_id = $1 AND state = 'succeeded' \
-                   AND result_code = 'checkout_created' AND provider_checkout_session_id = $2",
+                   AND result_code = 'checkout_created' AND provider_operation_id = $2 \
+                   AND (provider_checkout_session_id IS NULL OR provider_checkout_session_id = $2)",
             )
             .bind(operation_id)
             .bind(session_id)
@@ -962,6 +975,76 @@ pub async fn load_personal_reconciliation_candidates(
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(operation_from_row).collect()
+}
+
+/// Claim one locally expired pending personal account with a known Checkout session. The session
+/// identifier falls back to provider_operation_id for rows written before the dedicated column
+/// was introduced.
+pub async fn claim_expired_personal_checkout(
+    pool: &PgPool,
+    lease_token: &str,
+    user_id: Option<&str>,
+) -> Result<Option<ExpiredPersonalCheckout>, BillingOperationError> {
+    if lease_token.trim().is_empty() {
+        return Err(BillingOperationError::InvalidField("recovery lease token"));
+    }
+    let row = sqlx::query(
+        "WITH candidate AS (\
+           SELECT operation.operation_id, \
+                  COALESCE(operation.provider_checkout_session_id, operation.provider_operation_id) AS session_id \
+           FROM billing_operations AS operation \
+           JOIN billing_personal_accounts AS account USING (operation_id) \
+           WHERE account.state = 'pending' \
+             AND account.pending_expires_at_epoch <= extract(epoch FROM now())::bigint \
+             AND operation.payer_id = account.user_id \
+             AND operation.beneficiary_id = account.user_id \
+             AND operation.result_code IN ('checkout_created', 'provider_idempotency_window_elapsed') \
+             AND COALESCE(operation.provider_checkout_session_id, operation.provider_operation_id) IS NOT NULL \
+             AND left(COALESCE(operation.provider_checkout_session_id, operation.provider_operation_id), 3) = 'cs_' \
+             AND ($2::text IS NULL OR account.user_id = $2) \
+             AND operation.reconciliation_next_attempt_at <= now() \
+             AND (operation.reconciliation_lease_until IS NULL OR operation.reconciliation_lease_until < now()) \
+           ORDER BY account.pending_expires_at_epoch, operation.operation_id \
+           LIMIT 1 FOR UPDATE OF operation SKIP LOCKED\
+         ) \
+         UPDATE billing_operations AS operation \
+         SET reconciliation_lease_token = $1, reconciliation_lease_until = now() + interval '5 minutes', \
+             updated_at = now() \
+         FROM candidate \
+         WHERE operation.operation_id = candidate.operation_id \
+         RETURNING operation.operation_id, candidate.session_id",
+    )
+    .bind(lease_token)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok(ExpiredPersonalCheckout {
+            operation_id: row.try_get("operation_id")?,
+            session_id: row.try_get("session_id")?,
+            lease_token: lease_token.to_string(),
+        })
+    })
+    .transpose()
+}
+
+/// Release a session-status check without changing the billing operation's outcome.
+pub async fn release_expired_personal_checkout_check(
+    pool: &PgPool,
+    operation_id: &str,
+    lease_token: &str,
+) -> Result<bool, BillingOperationError> {
+    let released = sqlx::query_scalar::<_, String>(
+        "UPDATE billing_operations SET reconciliation_lease_token = NULL, \
+         reconciliation_lease_until = NULL, reconciliation_next_attempt_at = now() + interval '5 minutes', \
+         updated_at = now() WHERE operation_id = $1 AND reconciliation_lease_token = $2 \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(lease_token)
+    .fetch_optional(pool)
+    .await?;
+    Ok(released.is_some())
 }
 
 /// Load one operation only when it belongs to the authenticated actor. A missing row and a row

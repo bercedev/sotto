@@ -13,8 +13,8 @@ use tokio::sync::Notify;
 use tokio::time::{timeout, Duration};
 
 use sotto_server::billing::{
-    self, BillingState, PersonalCheckoutSession, ProviderResult, SubscriptionObservation,
-    SubscriptionProvider,
+    self, BillingState, PersonalCheckoutSession, PersonalCheckoutStatus, ProviderResult,
+    SubscriptionObservation, SubscriptionProvider,
 };
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{
@@ -123,6 +123,14 @@ impl SubscriptionProvider for RecoveryCheckoutProvider {
             session_id: Some("cs_recovered_personal".into()),
             checkout_url: "https://checkout.example.test/cs_recovered_personal".into(),
         })
+    }
+
+    async fn get_personal_checkout_status(
+        &self,
+        _session_id: &str,
+        _operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        Ok(PersonalCheckoutStatus::ExpiredUnpaid)
     }
 
     async fn create_portal(
@@ -513,6 +521,107 @@ async fn refund_required_checkout_is_parked_without_another_provider_request() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.received.lock().unwrap().len(), 0);
 
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn locally_expired_personal_checkout_is_reconciled_from_legacy_session_id() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-expired-session-recovery";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let mut tx = pool.begin().await.expect("begin operation transaction");
+    let operation = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "expired-session-recovery-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => operation,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    sotto_server::personal_billing::begin_account(
+        &mut tx,
+        USER_ID,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        4_000_000_100,
+        4_000_000_000,
+    )
+    .await
+    .expect("persist personal account");
+    record_personal_checkout_request(
+        &mut tx,
+        &operation.operation_id,
+        "price_original_monthly",
+        "https://app.sotto.test/app?billing=success",
+        "https://app.sotto.test/app?billing=cancelled",
+    )
+    .await
+    .expect("persist provider request");
+    record_provider_result(
+        &mut tx,
+        &operation.operation_id,
+        BillingOperationState::Succeeded,
+        Some("cs_legacy_expired"),
+        Some("checkout_created"),
+    )
+    .await
+    .expect("persist pre-migration session binding");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET pending_expires_at_epoch = \
+         extract(epoch FROM now())::bigint - 60 WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&mut *tx)
+    .await
+    .expect("expire account locally");
+    tx.commit().await.expect("commit operation");
+
+    let provider = RecoveryCheckoutProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        lose_first_response: false,
+    };
+    let billing_state = BillingState::with_provider(
+        Arc::new(provider.clone()),
+        "whsec_test".into(),
+        "https://app.sotto.test".into(),
+    );
+
+    assert!(
+        billing::recover_personal_billing_operation_once(&pool, &billing_state)
+            .await
+            .expect("reconcile provider expiry for old account")
+    );
+    let account_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_personal_accounts WHERE operation_id = $1")
+            .bind(&operation.operation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read released account");
+    assert_eq!(account_state, "canceled");
+    let operation_result: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT state, result_code, provider_checkout_session_id \
+         FROM billing_operations WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read expired operation");
+    assert_eq!(operation_result.0, "failed");
+    assert_eq!(operation_result.1, "checkout_expired");
+    assert_eq!(operation_result.2.as_deref(), Some("cs_legacy_expired"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     cleanup(&pool, USER_ID).await;
 }
 

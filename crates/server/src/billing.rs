@@ -356,6 +356,14 @@ pub struct PersonalCheckoutSession {
     pub checkout_url: String,
 }
 
+/// Stripe's current status for a previously-created personal Checkout session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonalCheckoutStatus {
+    Open,
+    Complete,
+    ExpiredUnpaid,
+}
+
 /// A beneficiary-authorised Checkout session for saving a payment method before a transfer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferSetupSession {
@@ -546,6 +554,16 @@ pub trait SubscriptionProvider: Send + Sync {
             session_id: None,
             checkout_url,
         })
+    }
+
+    /// Read a previously-created personal Checkout session before releasing its pending account.
+    /// Implementations must bind the returned resource to both identifiers.
+    async fn get_personal_checkout_status(
+        &self,
+        _session_id: &str,
+        _operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        Err(ProviderError::unsupported("personal_checkout_lookup"))
     }
 
     /// Create the initial named sponsored subscription checkout. All price classes are sent in
@@ -1291,6 +1309,23 @@ impl SubscriptionProvider for StripeBilling {
             session_id: Some(session_id.to_string()),
             checkout_url: checkout_url.to_string(),
         })
+    }
+
+    async fn get_personal_checkout_status(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        if session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("checkout/sessions/{session_id}"),
+        )
+        .await?;
+        personal_checkout_status_from_object(&value, session_id, operation_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3224,6 +3259,9 @@ async fn personal_quote(
         .map_err(ProviderError::into_error)?;
     let requested_interval = FoundingOffer::for_billing_offer_interval(requested_offer);
     validate_personal_catalogue(billing, catalogue).await?;
+    reconcile_expired_personal_checkout_once(&state.pool, billing, Some(&user.user_id))
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let now = billing_epoch();
     let expires = now
         .checked_add(founding_allocator::RESERVATION_SECONDS)
@@ -3335,6 +3373,9 @@ async fn personal_checkout(
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
+    reconcile_expired_personal_checkout_once(&state.pool, billing, Some(&user.user_id))
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let mut tx = state.pool.begin().await?;
     founding_allocator::lock_capacity(&mut tx)
         .await
@@ -3547,7 +3588,7 @@ pub async fn recover_personal_billing_operation_once(
     let mut candidates =
         billing_operations::load_personal_reconciliation_candidates(pool, 1).await?;
     let Some(candidate) = candidates.pop() else {
-        return Ok(false);
+        return reconcile_expired_personal_checkout_once(pool, billing, None).await;
     };
     let claim_token = format!("billing-recovery:{}", uuid::Uuid::new_v4());
     let operation =
@@ -3771,6 +3812,146 @@ pub async fn recover_personal_billing_operation_once(
                 &operation.operation_id,
                 &claim_token,
                 "provider_outcome_uncertain",
+            )
+            .await?;
+        }
+    }
+    Ok(true)
+}
+
+/// Reconcile an expired local pending account against Stripe's current session state. This also
+/// repairs accounts whose signed expiry event was acknowledged by an older server or exhausted
+/// Stripe's webhook retry window.
+async fn reconcile_expired_personal_checkout_once(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    user_id: Option<&str>,
+) -> std::result::Result<bool, billing_operations::BillingRecoveryError> {
+    let lease_token = format!("billing-expiry-recovery:{}", uuid::Uuid::new_v4());
+    let Some(candidate) =
+        billing_operations::claim_expired_personal_checkout(pool, &lease_token, user_id).await?
+    else {
+        return Ok(false);
+    };
+    let status = billing
+        .provider
+        .get_personal_checkout_status(&candidate.session_id, &candidate.operation_id)
+        .await;
+    match status {
+        Ok(PersonalCheckoutStatus::ExpiredUnpaid) => {
+            let mut tx = pool.begin().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
+            })?;
+            founding_allocator::lock_capacity(&mut tx)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "capacity_lock_failed".into(),
+                    )
+                })?;
+            let account = sqlx::query(
+                "SELECT state, pending_expires_at_epoch, user_id \
+                 FROM billing_personal_accounts WHERE operation_id = $1 FOR UPDATE",
+            )
+            .bind(&candidate.operation_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_read_failed".into())
+            })?;
+            let Some(account) = account else {
+                tx.rollback().await.ok();
+                billing_operations::release_expired_personal_checkout_check(
+                    pool,
+                    &candidate.operation_id,
+                    &candidate.lease_token,
+                )
+                .await?;
+                return Ok(true);
+            };
+            let state: String = account.try_get("state").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            let expires_at: i64 = account.try_get("pending_expires_at_epoch").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            let user_id: String = account.try_get("user_id").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            if state != "pending" || expires_at > billing_epoch() {
+                tx.rollback().await.ok();
+                billing_operations::release_expired_personal_checkout_check(
+                    pool,
+                    &candidate.operation_id,
+                    &candidate.lease_token,
+                )
+                .await?;
+                return Ok(true);
+            }
+            let operation = billing_operations::record_checkout_expired(
+                &mut tx,
+                &candidate.operation_id,
+                &candidate.session_id,
+            )
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("operation_update_failed".into())
+            })?;
+            sqlx::query(
+                "UPDATE billing_personal_accounts SET state='canceled', updated_at=now() \
+                 WHERE operation_id=$1 AND state='pending'",
+            )
+            .bind(&candidate.operation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_account_update_failed".into(),
+                )
+            })?;
+            founding_allocator::release_reservation(&mut tx, &candidate.operation_id)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "reservation_release_failed".into(),
+                    )
+                })?;
+            crate::notifications::enqueue_checkout_outcome_in_tx(
+                &mut tx,
+                &user_id,
+                &candidate.operation_id,
+                crate::notifications::CheckoutOutcome::Expired,
+            )
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "notification_enqueue_failed".into(),
+                )
+            })?;
+            tx.commit().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_commit_failed".into())
+            })?;
+            let _ = operation;
+        }
+        Ok(PersonalCheckoutStatus::Open | PersonalCheckoutStatus::Complete) => {
+            billing_operations::release_expired_personal_checkout_check(
+                pool,
+                &candidate.operation_id,
+                &candidate.lease_token,
+            )
+            .await?;
+        }
+        Err(_) => {
+            billing_operations::release_expired_personal_checkout_check(
+                pool,
+                &candidate.operation_id,
+                &candidate.lease_token,
             )
             .await?;
         }
@@ -4776,6 +4957,27 @@ fn transfer_setup_session_from_object(
         status: status.to_string(),
         expires_at_epoch,
     })
+}
+
+fn personal_checkout_status_from_object(
+    object: &serde_json::Value,
+    expected_session_id: &str,
+    expected_operation_id: &str,
+) -> ProviderResult<PersonalCheckoutStatus> {
+    if object["object"].as_str() != Some("checkout.session")
+        || object["id"].as_str() != Some(expected_session_id)
+        || object["mode"].as_str() != Some("subscription")
+        || object["client_reference_id"].as_str()
+            != Some(format!("personal:{expected_operation_id}").as_str())
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    match (object["status"].as_str(), object["payment_status"].as_str()) {
+        (Some("open"), Some("unpaid")) => Ok(PersonalCheckoutStatus::Open),
+        (Some("complete"), Some("unpaid" | "paid")) => Ok(PersonalCheckoutStatus::Complete),
+        (Some("expired"), Some("unpaid")) => Ok(PersonalCheckoutStatus::ExpiredUnpaid),
+        _ => Err(ProviderError::malformed_response()),
+    }
 }
 
 fn transfer_setup_intent_from_object(
@@ -13782,6 +13984,50 @@ mod tests {
         );
         assert!(personal_checkout_expiry(now, now).is_err());
         assert!(personal_checkout_expiry(quote_expiry + 1, now).is_err());
+    }
+
+    #[test]
+    fn personal_checkout_expiry_requires_the_exact_unpaid_session_binding() {
+        let expired = serde_json::json!({
+            "object": "checkout.session",
+            "id": "cs_personal",
+            "mode": "subscription",
+            "client_reference_id": "personal:billing:operation",
+            "status": "expired",
+            "payment_status": "unpaid"
+        });
+        assert_eq!(
+            personal_checkout_status_from_object(&expired, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::ExpiredUnpaid
+        );
+        let mut paid = expired.clone();
+        paid["payment_status"] = serde_json::json!("paid");
+        assert!(
+            personal_checkout_status_from_object(&paid, "cs_personal", "billing:operation")
+                .is_err()
+        );
+        assert!(
+            personal_checkout_status_from_object(&expired, "cs_other", "billing:operation")
+                .is_err()
+        );
+        assert!(
+            personal_checkout_status_from_object(&expired, "cs_personal", "billing:other").is_err()
+        );
+        let mut open = expired.clone();
+        open["status"] = serde_json::json!("open");
+        assert_eq!(
+            personal_checkout_status_from_object(&open, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Open
+        );
+        let mut complete = open;
+        complete["status"] = serde_json::json!("complete");
+        assert_eq!(
+            personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Complete
+        );
     }
 
     #[test]
