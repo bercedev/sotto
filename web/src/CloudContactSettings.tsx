@@ -13,6 +13,18 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function deliveryMessage(state: NonNullable<CloudContactStatus["latestDelivery"]>["state"]): string {
+  switch (state) {
+    case "queued": return "The latest lifecycle email is queued.";
+    case "accepted": return "The email service accepted the latest lifecycle email; delivery is not yet confirmed.";
+    case "delivery_unknown": return "We could not confirm whether the latest lifecycle email was sent. Check your inbox before requesting help.";
+    case "delivered": return "The email service confirmed delivery of the latest lifecycle email.";
+    case "failed": return "The latest lifecycle email could not be sent.";
+    case "bounced": return "The latest lifecycle email was returned by the recipient mail server. Verify a different address to resume email notices.";
+    case "suppressed": return "Email delivery is paused because the address could not accept a previous message.";
+  }
+}
+
 /** Contact management is available on the signed-in Cloud page without unlocking the vault. */
 export function CloudContactSettings() {
   const [status, setStatus] = useState<CloudContactStatus | "unsupported" | "error" | null>(null);
@@ -113,6 +125,9 @@ export function CloudContactSettings() {
         {status.email === null
           ? <p>No verified email contact is set.</p>
           : <p>Verified contact: <strong>{status.email.maskedDestination}</strong></p>}
+        {status.latestDelivery != null && <p className="muted" role="status">
+          {deliveryMessage(status.latestDelivery.state)}
+        </p>}
         {status.pendingExpiresAtEpoch !== null && <p className="muted">A verification request is pending. You can request another link if it expires.</p>}
         {status.enrolmentAvailable ? <>
           <label htmlFor="lifecycle-email">Email address</label>{" "}

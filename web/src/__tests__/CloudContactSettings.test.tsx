@@ -13,7 +13,12 @@ vi.mock("../api", () => ({
   UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
 }));
 
-const emptyStatus: api.CloudContactStatus = { email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: true };
+const emptyStatus: api.CloudContactStatus = {
+  email: null,
+  latestDelivery: null,
+  pendingExpiresAtEpoch: null,
+  enrolmentAvailable: true,
+};
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -67,6 +72,7 @@ describe("CloudContactSettings", () => {
         maskedDestination: "p***@example.test",
         verifiedAtEpoch: 1_800_000_000,
       },
+      latestDelivery: null,
       pendingExpiresAtEpoch: null,
       enrolmentAvailable: true,
     };
@@ -99,6 +105,7 @@ describe("CloudContactSettings", () => {
         maskedDestination: "p***@example.test",
         verifiedAtEpoch: 1_800_000_000,
       },
+      latestDelivery: null,
       pendingExpiresAtEpoch: null,
       enrolmentAvailable: true,
     });
@@ -114,5 +121,20 @@ describe("CloudContactSettings", () => {
     expect(await screen.findByText("Email contact settings require a newer Sotto server version.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Send verification link" })).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("shows only a safe delivery summary without exposing provider identifiers", async () => {
+    vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({
+      email: null,
+      latestDelivery: { state: "suppressed", updatedAtEpoch: 1_800_000_000 },
+      pendingExpiresAtEpoch: null,
+      enrolmentAvailable: true,
+    });
+    render(<CloudContactSettings />);
+
+    expect(await screen.findByText(
+      "Email delivery is paused because the address could not accept a previous message.",
+    )).toBeInTheDocument();
+    expect(screen.queryByText(/provider-message|@example\.test/)).not.toBeInTheDocument();
   });
 });

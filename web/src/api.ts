@@ -444,9 +444,22 @@ export interface VerifiedContactStatus {
 
 export interface CloudContactStatus {
   email: VerifiedContactStatus | null;
+  latestDelivery?: {
+    state: CloudEmailDeliveryState;
+    updatedAtEpoch: number;
+  } | null;
   pendingExpiresAtEpoch: number | null;
   enrolmentAvailable: boolean;
 }
+
+export type CloudEmailDeliveryState =
+  | "queued"
+  | "accepted"
+  | "delivery_unknown"
+  | "delivered"
+  | "failed"
+  | "bounced"
+  | "suppressed";
 
 export class UnsupportedCloudContactError extends Error {
   constructor() {
@@ -465,6 +478,10 @@ export async function fetchCloudContactStatus(): Promise<CloudContactStatus> {
       masked_destination: string;
       verified_at_epoch: number;
     } | null;
+    latest_delivery?: {
+      state: CloudEmailDeliveryState;
+      updated_at_epoch: number;
+    } | null;
     pending_expires_at_epoch: number | null;
     enrolment_available: boolean;
   };
@@ -473,6 +490,10 @@ export async function fetchCloudContactStatus(): Promise<CloudContactStatus> {
       contactId: body.email.contact_id,
       maskedDestination: body.email.masked_destination,
       verifiedAtEpoch: body.email.verified_at_epoch,
+    },
+    latestDelivery: body.latest_delivery == null ? null : {
+      state: body.latest_delivery.state,
+      updatedAtEpoch: body.latest_delivery.updated_at_epoch,
     },
     pendingExpiresAtEpoch: body.pending_expires_at_epoch,
     enrolmentAvailable: body.enrolment_available === true,

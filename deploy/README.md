@@ -1173,6 +1173,24 @@ To disable the journey, turn both flags off and restart the server. Existing ver
 retained, and users can still revoke their own contact. Re-enabling the flags does not resend an
 old challenge; the user starts a fresh verification request.
 
+Lifecycle-notice email dispatch is a separate Cloud-only control:
+`SOTTO_CLOUD_NOTICE_DISPATCH_ENABLED` defaults to `0`. It requires the configured Resend API
+credential, sender address and webhook signing secret. The callback path is rate-limited at the
+edge and accepts only signed provider feedback. Relay acceptance is recorded separately from a
+verified delivery event. Notices with a future due date are not sent early; uncertain sends are
+retried with one stable message identity only inside the provider's idempotency window. The
+dispatcher never enables sales or coverage enforcement and is not started on self-hosted instances.
+Each email links to the no-vault `/cloud` account surface.
+Impending-purge email remains unavailable until the purge notice timing policy is approved; dispatch
+does not infer a cadence from the retention deadline.
+
+Protected notice diagnostics are available at `/ops/cloud/notices` when the existing Cloud retention
+operator token is configured. The endpoint returns bounded opaque fingerprints and fixed reason
+codes only. `retry` is limited to a known rejected request with a current verified contact and a
+remaining idempotency window; `suppress` only stops work that has not been accepted by the provider.
+Operator labels are declared audit text, not authenticated identities. A sent message cannot be
+recalled, and this surface is not a live-delivery rehearsal.
+
 ## Database security
 
 The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** - it
