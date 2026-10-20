@@ -22,6 +22,12 @@ use sotto_server::db;
 use sotto_server::notifications;
 use sotto_server::state::AppState;
 
+mod support {
+    pub mod migrations;
+}
+
+use support::migrations::{migrator_before, DisposableDatabase};
+
 fn test_lock() -> &'static AsyncMutex<()> {
     static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| AsyncMutex::new(()))
@@ -658,4 +664,72 @@ async fn contact_routes_require_a_session_and_send_through_the_authenticated_rou
         .expect("authenticated response");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(messages.lock().expect("messages").len(), 1);
+}
+
+#[tokio::test]
+async fn migration_revokes_ambiguous_legacy_email_owners_before_unique_index() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    migrator_before(68)
+        .run(&database.pool)
+        .await
+        .expect("apply migrations before contact verification");
+
+    seed_user(&database.pool, "legacy-contact-owner-a").await;
+    seed_user(&database.pool, "legacy-contact-owner-b").await;
+    seed_user(&database.pool, "legacy-contact-owner-c").await;
+    for (contact_id, user_id, destination) in [
+        (
+            "legacy-shared-contact-a",
+            "legacy-contact-owner-a",
+            "Shared@example.test",
+        ),
+        (
+            "legacy-shared-contact-b",
+            "legacy-contact-owner-b",
+            "shared@example.test",
+        ),
+        (
+            "legacy-unique-contact",
+            "legacy-contact-owner-c",
+            "unique@example.test",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO cloud_verified_contacts \
+             (contact_id,user_id,channel,destination,verified_at) \
+             VALUES ($1,$2,'email',$3,now())",
+        )
+        .bind(contact_id)
+        .bind(user_id)
+        .bind(destination)
+        .execute(&database.pool)
+        .await
+        .expect("seed legacy verified contact");
+    }
+
+    db::migrate(&database.pool)
+        .await
+        .expect("migration revokes duplicate legacy addresses before indexing");
+
+    let active_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT contact_id FROM cloud_verified_contacts WHERE revoked_at IS NULL ORDER BY contact_id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .expect("load active contacts after upgrade");
+    assert_eq!(active_ids, ["legacy-unique-contact"]);
+
+    let revoked_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_verified_contacts \
+         WHERE contact_id IN ('legacy-shared-contact-a','legacy-shared-contact-b') \
+           AND revoked_at IS NOT NULL",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("count revoked ambiguous contacts");
+    assert_eq!(revoked_count, 2);
+
+    database.cleanup().await;
 }

@@ -63,6 +63,22 @@ CREATE INDEX cloud_contact_verification_rate_limits_window_idx
 CREATE INDEX cloud_contact_verification_challenge_cleanup_idx
     ON cloud_contact_verification_challenges (created_at);
 
+-- Older internal enrolment allowed the same address on multiple accounts. There is no safe
+-- account to choose as its owner, so revoke every ambiguous legacy claim before enforcing the
+-- new one-account-per-address rule. Users can verify the address again on the correct account.
+WITH ambiguous_destinations AS (
+    SELECT lower(destination) AS normalized_destination
+    FROM cloud_verified_contacts
+    WHERE revoked_at IS NULL
+    GROUP BY lower(destination)
+    HAVING count(*) > 1
+)
+UPDATE cloud_verified_contacts AS contact
+SET revoked_at = now()
+FROM ambiguous_destinations AS ambiguous
+WHERE contact.revoked_at IS NULL
+  AND lower(contact.destination) = ambiguous.normalized_destination;
+
 CREATE UNIQUE INDEX cloud_verified_contacts_destination_active_idx
     ON cloud_verified_contacts (lower(destination))
     WHERE revoked_at IS NULL;
