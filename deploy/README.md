@@ -1158,11 +1158,11 @@ organisations frozen until deletion is re-enabled or an operator recovers them t
 
 Contact enrolment is optional and independent of billing and vault access. Both
 `SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED` and `SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED` default to
-`0`; sends require enrolment to be enabled as well. Keep both off until the sender domain is
-authenticated and a test recipient has completed the full challenge flow. The server requires an
-HTTPS `SOTTO_WEB_ORIGIN`, a configured sender address, and the transport credential from the
-deployment secret store. Do not put the credential in a checked-in file or pass it on a command
-line.
+`0` and must be enabled together; the server rejects a partial configuration. Keep both off until
+the sender domain is authenticated and a test recipient has completed the full challenge flow.
+The server requires an HTTPS `SOTTO_WEB_ORIGIN`, a configured sender address, and the transport
+credential from the deployment secret store. Do not put the credential in a checked-in file or
+pass it on a command line.
 
 The contact endpoints let a signed-in user set, verify, view, and revoke their own lifecycle email
 address without unlocking the vault. Verification proves control of that address; it does not

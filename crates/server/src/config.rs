@@ -530,6 +530,11 @@ fn validate_founding_schedule_worker_configuration(
 }
 
 fn validate_contact_verification_configuration(config: &ContactVerificationConfig) -> Result<()> {
+    if config.enrolment_enabled && !config.email_sends_enabled {
+        return Err(Error::Config(
+            "SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED and SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED must be enabled together".into(),
+        ));
+    }
     if !config.email_sends_enabled {
         return Ok(());
     }
@@ -1054,6 +1059,16 @@ mod tests {
                 resend_api_key: Some("re_12345678".into()),
                 from_address: Some("no-reply@example.test".into()),
                 web_origin: Some("https://app.example.test".into()),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_contact_verification_configuration(&ContactVerificationConfig {
+                enrolment_enabled: true,
+                email_sends_enabled: false,
+                resend_api_key: None,
+                from_address: None,
+                web_origin: None,
             })
             .is_err()
         );

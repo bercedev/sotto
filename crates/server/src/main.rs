@@ -170,7 +170,9 @@ async fn run() -> Result<()> {
     // AppState owns billing; keep only the provider handle for the optional worker.
     let worker_provider = billing.as_ref().map(BillingState::provider);
 
-    let contact_verification = if config.contact_verification.email_sends_enabled {
+    let contact_verification = if config.contact_verification.enrolment_enabled
+        && config.contact_verification.email_sends_enabled
+    {
         let sender = ResendSender::new(
             config
                 .contact_verification
