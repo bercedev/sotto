@@ -471,6 +471,35 @@ pub async fn record_provider_result(
     load_operation(tx, operation_id).await
 }
 
+/// Record a verified paid invoice as authoritative completion of a personal billing operation.
+/// Unlike a provider-call result, signed payment evidence may arrive while a recovery worker owns
+/// the lease or after the operation was parked for review. The invoice path has already verified
+/// the account, subscription, customer and payment binding before calling this function.
+pub async fn record_verified_paid_invoice(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<BillingOperation, BillingOperationError> {
+    let updated = sqlx::query(
+        "UPDATE billing_operations SET state = 'succeeded', result_code = 'source_restoration_paid', \
+         reconciliation_manual_review_required = FALSE, reconciliation_last_error_code = NULL, \
+         reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND (state IN ('pending','unknown','manual_review') \
+           OR (state = 'succeeded' AND result_code = 'checkout_created')) RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let existing = load_operation(tx, operation_id).await?;
+        if existing.state != BillingOperationState::Succeeded
+            || existing.result_code.as_deref() != Some("source_restoration_paid")
+        {
+            return Err(BillingOperationError::ResultConflict);
+        }
+    }
+    load_operation(tx, operation_id).await
+}
+
 /// Complete the personal Checkout creation fact under a worker lease. This records the hosted
 /// session only; invoice webhooks remain the sole authority for payment and coverage.
 pub async fn record_claimed_checkout_result(

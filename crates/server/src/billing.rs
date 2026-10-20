@@ -10196,15 +10196,9 @@ async fn invoice_paid(
         )
         .await
         .map_err(personal_billing_error)?;
-        billing_operations::record_provider_result(
-            tx,
-            &operation_id,
-            billing_operations::BillingOperationState::Succeeded,
-            None,
-            Some("source_restoration_paid"),
-        )
-        .await
-        .map_err(Error::from)?;
+        billing_operations::record_verified_paid_invoice(tx, &operation_id)
+            .await
+            .map_err(Error::from)?;
     } else {
         personal_billing::record_invoice_paid(
             tx,
