@@ -8,7 +8,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use tower::ServiceExt;
 
@@ -58,6 +58,28 @@ async fn seed_user(pool: &PgPool, user_id: &str) {
         .expect("seed test user");
 }
 
+async fn wait_for_completed_sends(pool: &PgPool, user_id: &str, expected: i64) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let completed: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM cloud_contact_verification_send_attempts AS attempt \
+                 JOIN cloud_contact_verification_challenges AS challenge USING (challenge_id) \
+                 WHERE challenge.user_id=$1 AND attempt.outcome IN ('accepted','unknown','rejected')",
+            )
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("count completed contact sends");
+            if completed >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background contact sends finish");
+}
+
 fn app(pool: PgPool, contact_verification: Arc<ContactVerificationService>) -> Router {
     let state = AppState {
         pool,
@@ -92,11 +114,13 @@ struct RecordingSender {
     pool: PgPool,
     messages: Arc<Mutex<Vec<VerificationMessage>>>,
     outcome: SendOutcome,
+    delay: Duration,
 }
 
 #[async_trait]
 impl ContactVerificationSender for RecordingSender {
     async fn send(&self, message: VerificationMessage) -> SendOutcome {
+        tokio::time::sleep(self.delay).await;
         // This query must acquire the only connection. It times out if the caller keeps its
         // pre-send transaction open while awaiting the external sender.
         tokio::time::timeout(
@@ -127,6 +151,27 @@ fn service(
             pool,
             messages,
             outcome,
+            delay: Duration::ZERO,
+        }),
+    )
+    .expect("test contact service")
+}
+
+fn slow_service(
+    pool: PgPool,
+    messages: Arc<Mutex<Vec<VerificationMessage>>>,
+    outcome: SendOutcome,
+    delay: Duration,
+) -> ContactVerificationService {
+    ContactVerificationService::new(
+        true,
+        true,
+        "https://app.example.test",
+        Arc::new(RecordingSender {
+            pool,
+            messages,
+            outcome,
+            delay,
         }),
     )
     .expect("test contact service")
@@ -174,6 +219,7 @@ async fn verification_replaces_contact_only_after_user_bound_one_time_proof() {
     .await
     .expect("start verification");
     assert!(response.accepted);
+    wait_for_completed_sends(&pool, &user_id, 1).await;
 
     let message = messages
         .lock()
@@ -268,6 +314,7 @@ async fn resend_is_idempotent_and_unknown_delivery_remains_confirmable() {
         .expect("idempotent resend request");
         assert!(outcome.accepted);
     }
+    wait_for_completed_sends(&pool, &user_id, 1).await;
     let token = {
         let sent = messages.lock().expect("message lock");
         assert_eq!(sent.len(), 1);
@@ -394,9 +441,11 @@ async fn account_and_destination_send_limits_are_enforced() {
         .await,
         Err(sotto_server::error::Error::RateLimited(_))
     ));
+    wait_for_completed_sends(&pool, &user_id, 5).await;
     assert_eq!(messages.lock().expect("messages").len(), 5);
 
     let destination = format!("contact-destination-{}@example.test", uuid::Uuid::new_v4());
+    let mut destination_users = Vec::new();
     for request in 0..3 {
         let next_user = format!("contact-destination-user-{}", uuid::Uuid::new_v4());
         seed_user(&pool, &next_user).await;
@@ -411,6 +460,7 @@ async fn account_and_destination_send_limits_are_enforced() {
         )
         .await
         .expect("three destination requests fit the configured hourly limit");
+        destination_users.push(next_user);
     }
     let last_user = format!("contact-destination-user-{}", uuid::Uuid::new_v4());
     seed_user(&pool, &last_user).await;
@@ -427,6 +477,9 @@ async fn account_and_destination_send_limits_are_enforced() {
         .await,
         Err(sotto_server::error::Error::RateLimited(_))
     ));
+    for destination_user in destination_users {
+        wait_for_completed_sends(&pool, &destination_user, 1).await;
+    }
 }
 
 #[tokio::test]
@@ -509,6 +562,7 @@ async fn expired_challenges_cannot_be_used_and_idempotency_keys_bind_the_address
     )
     .await
     .expect("start challenge");
+    wait_for_completed_sends(&pool, &user_id, 1).await;
     assert!(matches!(
         contact_verification::start_verification(
             &pool,
@@ -573,7 +627,7 @@ async fn provider_io_runs_without_a_held_database_connection() {
     let messages = Arc::new(Mutex::new(Vec::new()));
     let service = service(
         single_connection.clone(),
-        messages,
+        messages.clone(),
         SendOutcome::Accepted {
             provider_message_id: format!("provider-{}", uuid::Uuid::new_v4()),
         },
@@ -589,6 +643,7 @@ async fn provider_io_runs_without_a_held_database_connection() {
     )
     .await
     .expect("sender can borrow released connection");
+    wait_for_completed_sends(&single_connection, &user_id, 1).await;
     single_connection.close().await;
     pool.close().await;
 }
@@ -663,6 +718,86 @@ async fn contact_routes_require_a_session_and_send_through_the_authenticated_rou
         .await
         .expect("authenticated response");
     assert_eq!(response.status(), StatusCode::OK);
+    wait_for_completed_sends(&pool, &user_id, 1).await;
+    assert_eq!(messages.lock().expect("messages").len(), 1);
+}
+
+#[tokio::test]
+async fn taken_and_available_addresses_return_without_waiting_for_email_delivery() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let owner = format!("contact-timing-owner-{}", uuid::Uuid::new_v4());
+    let free_user = format!("contact-timing-free-{}", uuid::Uuid::new_v4());
+    let taken_user = format!("contact-timing-taken-{}", uuid::Uuid::new_v4());
+    let taken_destination = format!("timing-{}@example.test", uuid::Uuid::new_v4());
+    let free_destination = format!("free-{}@example.test", uuid::Uuid::new_v4());
+    seed_user(&pool, &owner).await;
+    seed_user(&pool, &free_user).await;
+    seed_user(&pool, &taken_user).await;
+    notifications::record_verified_email(
+        &pool,
+        &format!("timing-contact-{}", uuid::Uuid::new_v4()),
+        &owner,
+        &taken_destination,
+        1_800_000_000,
+    )
+    .await
+    .expect("seed owned destination");
+
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let service = slow_service(
+        pool.clone(),
+        messages.clone(),
+        SendOutcome::Accepted {
+            provider_message_id: format!("provider-{}", uuid::Uuid::new_v4()),
+        },
+        Duration::from_millis(400),
+    );
+
+    let started = Instant::now();
+    contact_verification::start_verification(
+        &pool,
+        &service,
+        &free_user,
+        StartVerificationRequest {
+            email: free_destination,
+            idempotency_key: format!("timing-free:{}", uuid::Uuid::new_v4()),
+        },
+    )
+    .await
+    .expect("available address request");
+    let free_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    contact_verification::start_verification(
+        &pool,
+        &service,
+        &taken_user,
+        StartVerificationRequest {
+            email: taken_destination,
+            idempotency_key: format!("timing-taken:{}", uuid::Uuid::new_v4()),
+        },
+    )
+    .await
+    .expect("taken address request");
+    let taken_elapsed = started.elapsed();
+
+    assert!(
+        free_elapsed < Duration::from_millis(300),
+        "available destination waited for sender: {free_elapsed:?}"
+    );
+    assert!(
+        taken_elapsed < Duration::from_millis(300),
+        "taken destination response was unexpectedly slow: {taken_elapsed:?}"
+    );
+    assert!(
+        free_elapsed.abs_diff(taken_elapsed) < Duration::from_millis(250),
+        "destination response times diverged: free={free_elapsed:?}, taken={taken_elapsed:?}"
+    );
+
+    wait_for_completed_sends(&pool, &free_user, 1).await;
     assert_eq!(messages.lock().expect("messages").len(), 1);
 }
 

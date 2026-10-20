@@ -474,8 +474,18 @@ pub async fn start_verification(
         verification_url: service.verification_url(&prepared.token),
         expires_at_epoch: prepared.expires_at_epoch,
     };
-    let outcome = service.sender.send(message).await;
-    record_send_outcome(pool, &prepared.challenge_id, outcome).await?;
+    // Do not let provider latency reveal whether the destination belongs to another account.
+    // Both the "already handled" path above and this path return after durable preparation;
+    // delivery and its outcome recording happen outside the request.
+    let sender = service.sender.clone();
+    let pool = pool.clone();
+    let challenge_id = prepared.challenge_id;
+    tokio::spawn(async move {
+        let outcome = sender.send(message).await;
+        if let Err(error) = record_send_outcome(&pool, &challenge_id, outcome).await {
+            eprintln!("contact verification send outcome could not be recorded: {error}");
+        }
+    });
     Ok(StartVerificationResponse { accepted: true })
 }
 
