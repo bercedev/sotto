@@ -249,6 +249,14 @@ impl SubscriptionProvider for TestProvider {
         }))
     }
 
+    async fn validate_personal_price(
+        &self,
+        _price_id: &str,
+        _offer: BillingOffer,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
     async fn cancel_subscription(
         &self,
         _subscription_id: &str,
@@ -2957,6 +2965,80 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
         .await
         .unwrap();
     stripe_task.abort();
+}
+
+#[tokio::test]
+async fn expired_pending_personal_account_cannot_receive_a_new_quote() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-expired-pending-quote-{fixture}");
+    let token = seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("expired-pending-quote-{fixture}")).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET pending_expires_at_epoch = $2 WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .bind(now - 1)
+    .execute(&pool)
+    .await
+    .expect("expire pending account locally");
+
+    let billing = BillingState::with_provider_and_cloud_sales(
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+        WEBHOOK_SECRET.into(),
+        "https://app.sotto.test".into(),
+        true,
+    )
+    .with_price_catalogue(BillingPriceIds {
+        standard_monthly: "price_standard_monthly".into(),
+        standard_annual: "price_standard_annual".into(),
+        founding_monthly: "price_founding_monthly".into(),
+        founding_annual: "price_founding_annual".into(),
+    });
+    let app = app_with_billing_mode(
+        pool.clone(),
+        Some(billing),
+        sotto_server::config::DeploymentMode::Cloud,
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/billing/personal/quote?offer=standard_monthly")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("request personal quote");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean user");
 }
 
 #[tokio::test]

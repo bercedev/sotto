@@ -3233,13 +3233,7 @@ async fn personal_quote(
         .await
         .map_err(personal_billing_error)?
     {
-        let reusable = matches!(
-            account.state,
-            personal_billing::PersonalBillingState::Canceled
-        ) || (matches!(
-            account.state,
-            personal_billing::PersonalBillingState::Pending
-        ) && account.pending_expires_at_epoch <= now);
+        let reusable = personal_quote_account_is_reusable(account.state);
         if !reusable {
             return Err(Error::Conflict(
                 "personal billing is already active or pending".into(),
@@ -3474,7 +3468,15 @@ async fn personal_checkout(
     };
     let checkout_expires_at_epoch = match checkout_expires_at_epoch {
         Some(expiry) => expiry,
-        None => personal_checkout_expiry(operation.quote_expires_at_epoch, billing_epoch())?,
+        None => personal_checkout_expiry_for_retry(
+            sqlx::query_scalar(
+                "SELECT pending_expires_at_epoch FROM billing_personal_accounts WHERE operation_id = $1",
+            )
+            .bind(&operation.operation_id)
+            .fetch_one(&state.pool)
+            .await?,
+            billing_epoch(),
+        )?,
     };
     let allocation_reference: String = sqlx::query_scalar(
         "SELECT allocation_reference FROM billing_personal_accounts WHERE operation_id = $1",
@@ -3585,6 +3587,21 @@ pub async fn recover_personal_billing_operation_once(
     let account_state: String = account.try_get("state").map_err(|_| {
         billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
     })?;
+    if account_state == "refund_required" {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "paid_checkout_requires_refund",
+        )
+        .await
+        .map_err(|_| {
+            billing_operations::BillingRecoveryError::Provider(
+                "recovery_review_update_failed".into(),
+            )
+        })?;
+        return Ok(true);
+    }
     if matches!(account_state.as_str(), "active" | "past_due" | "unpaid") {
         let mut tx = pool.begin().await.map_err(|_| {
             billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
@@ -3700,7 +3717,10 @@ pub async fn recover_personal_billing_operation_once(
                 .await?;
             }
         }
-        Err(error) if provider_failure_is_definitive(&error) && error.status == Some(400 | 404) => {
+        Err(error)
+            if provider_failure_is_definitive(&error)
+                && definitive_checkout_status(error.status) =>
+        {
             let mut tx = pool.begin().await.map_err(|_| {
                 billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
             })?;
@@ -3771,6 +3791,23 @@ fn personal_checkout_expiry(quote_expires_at_epoch: i64, now_epoch: i64) -> Resu
     quote_expires_at_epoch
         .checked_add(founding_allocator::RESERVATION_SECONDS)
         .ok_or_else(|| Error::Internal("billing clock overflow".into()))
+}
+
+fn personal_quote_account_is_reusable(state: personal_billing::PersonalBillingState) -> bool {
+    matches!(state, personal_billing::PersonalBillingState::Canceled)
+}
+
+fn personal_checkout_expiry_for_retry(pending_expiry_epoch: i64, now_epoch: i64) -> Result<i64> {
+    if pending_expiry_epoch <= now_epoch {
+        return Err(Error::Conflict(
+            "personal Checkout has expired; wait for its signed expiry event".into(),
+        ));
+    }
+    Ok(pending_expiry_epoch)
+}
+
+fn definitive_checkout_status(status: Option<u16>) -> bool {
+    matches!(status, Some(400 | 404))
 }
 
 async fn personal_operation(
@@ -13745,6 +13782,38 @@ mod tests {
         );
         assert!(personal_checkout_expiry(now, now).is_err());
         assert!(personal_checkout_expiry(quote_expiry + 1, now).is_err());
+    }
+
+    #[test]
+    fn expired_quote_retries_use_the_existing_checkout_deadline() {
+        let quote_expiry = 100;
+        let now = 110;
+        let original_checkout_expiry = 130;
+        assert!(quote_expiry < now);
+        assert_eq!(
+            personal_checkout_expiry_for_retry(original_checkout_expiry, now).unwrap(),
+            original_checkout_expiry
+        );
+        assert!(personal_checkout_expiry_for_retry(now, now).is_err());
+    }
+
+    #[test]
+    fn expired_pending_personal_accounts_are_not_quote_reusable() {
+        assert!(!personal_quote_account_is_reusable(
+            personal_billing::PersonalBillingState::Pending
+        ));
+        assert!(personal_quote_account_is_reusable(
+            personal_billing::PersonalBillingState::Canceled
+        ));
+    }
+
+    #[test]
+    fn definitive_checkout_status_matches_http_codes_individually() {
+        assert!(definitive_checkout_status(Some(400)));
+        assert!(definitive_checkout_status(Some(404)));
+        assert!(!definitive_checkout_status(Some(401)));
+        assert!(!definitive_checkout_status(Some(500)));
+        assert!(!definitive_checkout_status(None));
     }
 
     #[test]
