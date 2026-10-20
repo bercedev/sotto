@@ -25,6 +25,7 @@ pub mod auth;
 pub mod billing;
 pub mod billing_catalogue;
 pub mod billing_operations;
+pub mod billing_recovery_executor;
 #[doc(hidden)]
 pub mod billing_refunds;
 #[doc(hidden)]

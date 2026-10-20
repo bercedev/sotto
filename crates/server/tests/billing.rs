@@ -3213,6 +3213,28 @@ async fn personal_checkout_expiry_notice_is_independent_of_sponsored_billing() {
         post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
         StatusCode::OK
     );
+    let account_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_personal_accounts WHERE operation_id=$1")
+            .bind(&operation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read expired personal account");
+    assert_eq!(account_state, "canceled");
+    let (operation_state, result_code, session_id): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT state, result_code, provider_checkout_session_id FROM billing_operations \
+             WHERE operation_id=$1",
+        )
+        .bind(&operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read expired personal operation");
+    assert_eq!(operation_state, "failed");
+    assert_eq!(result_code, "checkout_expired");
+    assert_eq!(
+        session_id.as_deref(),
+        Some("cs_personal_checkout_expired_notice")
+    );
     let checkout_notices: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
          AND kind='checkout_outcome' AND channel='in_app' \
