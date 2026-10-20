@@ -436,6 +436,71 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
   }));
 }
 
+export interface VerifiedContactStatus {
+  contactId: string;
+  maskedDestination: string;
+  verifiedAtEpoch: number;
+}
+
+export interface CloudContactStatus {
+  email: VerifiedContactStatus | null;
+  pendingExpiresAtEpoch: number | null;
+  enrolmentAvailable: boolean;
+}
+
+export class UnsupportedCloudContactError extends Error {
+  constructor() {
+    super("Email contact settings require a newer Sotto server version.");
+    this.name = "UnsupportedCloudContactError";
+  }
+}
+
+export async function fetchCloudContactStatus(): Promise<CloudContactStatus> {
+  const response = await request("/account/contacts", CREDS);
+  if (response.status === 404) throw new UnsupportedCloudContactError();
+  if (!response.ok) throw new Error(`server error (${response.status})`);
+  const body = await readBody(() => response.json()) as {
+    email: {
+      contact_id: string;
+      masked_destination: string;
+      verified_at_epoch: number;
+    } | null;
+    pending_expires_at_epoch: number | null;
+    enrolment_available: boolean;
+  };
+  return {
+    email: body.email === null ? null : {
+      contactId: body.email.contact_id,
+      maskedDestination: body.email.masked_destination,
+      verifiedAtEpoch: body.email.verified_at_epoch,
+    },
+    pendingExpiresAtEpoch: body.pending_expires_at_epoch,
+    enrolmentAvailable: body.enrolment_available === true,
+  };
+}
+
+export async function startCloudContactVerification(email: string, idempotencyKey: string): Promise<void> {
+  await postJson<{ accepted: boolean }>("/account/contacts/verification", {
+    email,
+    idempotency_key: idempotencyKey,
+  }, true);
+}
+
+export async function confirmCloudContactVerification(token: string): Promise<boolean> {
+  const result = await postJson<{ verified: boolean }>(
+    "/account/contacts/verification/confirm",
+    { token },
+    true,
+  );
+  return result.verified;
+}
+
+export async function revokeCloudContact(): Promise<void> {
+  const resp = await request("/account/contacts", { method: "DELETE", ...CREDS });
+  if (resp.status === 404) throw new UnsupportedCloudContactError();
+  if (!resp.ok) throw new Error(`server error (${resp.status})`);
+}
+
 export type PersonalBillingTerm = "monthly" | "annual";
 export type BillingOffer =
   | "standard_monthly"
@@ -750,13 +815,14 @@ export async function fetchCloudExportChunk(exportId: string, index: number): Pr
   return authedJson(`/account/export/${encodeURIComponent(exportId)}/chunks/${index}`);
 }
 
-async function postJson<T>(path: string, value: unknown): Promise<T> {
+async function postJson<T>(path: string, value: unknown, unsupportedOn404 = false): Promise<T> {
   const resp = await request(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(value),
     ...CREDS,
   });
+  if (unsupportedOn404 && resp.status === 404) throw new UnsupportedCloudContactError();
   if (!resp.ok) throw new Error(`server error (${resp.status})`);
   return readBody(() => resp.json()) as Promise<T>;
 }
