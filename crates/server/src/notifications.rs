@@ -1834,7 +1834,16 @@ async fn notice_is_current(pool: &PgPool, lease: &NoticeLease) -> NoticeResult<O
                    SELECT 1 FROM billing_sponsored_seats seat \
                    WHERE seat.organization_id=transfer.destination_organization_id \
                      AND seat.beneficiary_id=transfer.beneficiary_id \
-                     AND seat.state IN ('pending','active','scheduled_removal')))))",
+                     AND seat.state IN ('pending','active','scheduled_removal')))) \
+               AND (transfer.destination_kind='personal' OR EXISTS ( \
+                 SELECT 1 FROM billing_sponsored_subscriptions destination_subscription \
+                 JOIN organizations destination_organization \
+                   ON destination_organization.id=destination_subscription.organization_id \
+                 WHERE destination_subscription.organization_id=transfer.destination_organization_id \
+                   AND destination_subscription.status='active' \
+                   AND destination_subscription.provider_subscription_id IS NOT NULL \
+                   AND destination_subscription.current_period_end=transfer.effective_from \
+                   AND destination_organization.lifecycle_state='active')))",
         )
         .bind(&lease.notice_id)
         .bind(&lease.recipient_user_id)
