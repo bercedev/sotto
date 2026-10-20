@@ -3080,6 +3080,15 @@ async fn delayed_personal_checkout_payment_honours_timely_founding_reservation()
     .expect("read delayed Checkout settlement");
     assert_eq!(account_state, "active");
     assert_eq!(reservation_state, "confirmed");
+    let checkout_notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND kind='checkout_outcome' AND channel='in_app' AND policy_key='cloud-checkout-outcome-v1'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load checkout outcome notice created by webhook");
+    assert_eq!(checkout_notices, 1);
 
     sqlx::query("DELETE FROM billing_founding_schedule_jobs WHERE beneficiary_id = $1")
         .bind(&user_id)

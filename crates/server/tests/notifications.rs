@@ -1812,3 +1812,107 @@ async fn deleted_contact_fails_queued_email_without_breaking_the_outbox_row() {
     assert_eq!(row.get::<Option<String>, _>("contact_id"), None);
     cleanup(&pool, USER_ID).await;
 }
+
+#[tokio::test]
+async fn payer_transfer_outcome_is_atomic_and_reaches_the_beneficiary_and_current_admin() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let user_id = format!("notification-transfer-{suffix}");
+    let organization_id = format!("notification-transfer-org-{suffix}");
+    let transfer_id = format!("transfer-notice-{suffix}");
+    cleanup(&pool, &user_id).await;
+    seed_user(&pool, &user_id).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    notifications::record_verified_email(
+        &pool,
+        &format!("contact-transfer-{suffix}"),
+        &user_id,
+        "transfer@example.test",
+        now_epoch,
+    )
+    .await
+    .expect("record verified contact");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by, tier) \
+         VALUES ($1, $2, $3, 'team')",
+    )
+    .bind(&organization_id)
+    .bind(b"opaque".as_slice())
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed transfer organisation");
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id,user_id,role) VALUES ($1,$2,'owner')",
+    )
+    .bind(&organization_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("seed transfer administrator");
+
+    let mut rolled_back = pool
+        .begin()
+        .await
+        .expect("begin transfer notice transaction");
+    notifications::enqueue_payer_transfer_outcome_in_tx(
+        &mut rolled_back,
+        &transfer_id,
+        &user_id,
+        std::slice::from_ref(&organization_id),
+        now_epoch + 30 * 24 * 60 * 60,
+    )
+    .await
+    .expect("enqueue transfer outcome before transaction rollback");
+    rolled_back
+        .rollback()
+        .await
+        .expect("roll back transfer notice");
+    let after_rollback: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_notice_outbox WHERE event_key=$1")
+            .bind(&transfer_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count notices after rollback");
+    assert_eq!(after_rollback, 0);
+
+    let mut committed = pool.begin().await.expect("begin committed transfer notice");
+    notifications::enqueue_payer_transfer_outcome_in_tx(
+        &mut committed,
+        &transfer_id,
+        &user_id,
+        std::slice::from_ref(&organization_id),
+        now_epoch + 30 * 24 * 60 * 60,
+    )
+    .await
+    .expect("enqueue transfer outcome");
+    committed.commit().await.expect("commit transfer outcome");
+    let recipients: Vec<(String, String)> = sqlx::query_as(
+        "SELECT recipient_user_id,channel FROM cloud_notice_outbox WHERE event_key=$1 \
+         AND kind='payer_transfer_outcome' ORDER BY channel",
+    )
+    .bind(&transfer_id)
+    .fetch_all(&pool)
+    .await
+    .expect("load transfer outcome channels");
+    assert_eq!(
+        recipients,
+        vec![
+            (user_id.clone(), "email".into()),
+            (user_id.clone(), "in_app".into())
+        ]
+    );
+
+    sqlx::query("DELETE FROM organizations WHERE id=$1")
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("remove transfer organisation");
+    cleanup(&pool, &user_id).await;
+}

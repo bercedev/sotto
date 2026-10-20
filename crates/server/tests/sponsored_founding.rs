@@ -455,6 +455,20 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         Some(format!("pi_founding_{fixture}").as_str())
     );
     assert_eq!(settled.2.as_deref(), Some(provider_item_id.as_str()));
+    let sponsorship_notice_recipients: Vec<String> = sqlx::query_scalar(
+        "SELECT recipient_user_id FROM cloud_notice_outbox WHERE event_key=$1 \
+         AND kind='sponsorship_change' AND channel='in_app' ORDER BY recipient_user_id",
+    )
+    .bind(&operation_id)
+    .fetch_all(&pool)
+    .await
+    .expect("load sponsorship outcome notices from paid invoice handler");
+    let mut expected_sponsorship_notice_recipients = vec![owner_id.clone(), beneficiary_id.clone()];
+    expected_sponsorship_notice_recipients.sort();
+    assert_eq!(
+        sponsorship_notice_recipients,
+        expected_sponsorship_notice_recipients
+    );
     let refunded_state: (String, Option<String>, String) = sqlx::query_as(
         "SELECT operation.state, operation.provider_payment_reference, seat.state \
          FROM billing_sponsored_operations AS operation \
