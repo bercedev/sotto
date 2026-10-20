@@ -8769,9 +8769,6 @@ async fn sponsored_checkout_expired(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
-    if !sponsored_billing_enabled() {
-        return Ok(());
-    }
     let Some(reference) = object["client_reference_id"].as_str() else {
         return Ok(());
     };
@@ -8792,6 +8789,9 @@ async fn sponsored_checkout_expired(
             .await
             .map_err(notification_error)?;
         }
+        return Ok(());
+    }
+    if !sponsored_billing_enabled() {
         return Ok(());
     }
     let Some(operation_id) = reference.strip_prefix("sponsored:") else {
