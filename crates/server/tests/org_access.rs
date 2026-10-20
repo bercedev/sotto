@@ -28,6 +28,7 @@ fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
+        contact_verification: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,

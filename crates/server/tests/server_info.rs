@@ -28,6 +28,7 @@ fn app(
         oauth_config: None,
         billing: None,
         telemetry_ingest: false,
+        contact_verification: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,

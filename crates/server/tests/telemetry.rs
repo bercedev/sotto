@@ -27,6 +27,7 @@ fn app(pool: PgPool, ingest: bool) -> Router {
         oauth_config: None,
         billing: None,
         telemetry_ingest: ingest,
+        contact_verification: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,

@@ -791,6 +791,7 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             oauth_config: None,
             billing: None,
             telemetry_ingest: false,
+            contact_verification: None,
             organisation_deletion_enabled: false,
             organisation_deletion_retention_days:
                 sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,

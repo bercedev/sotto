@@ -40,6 +40,7 @@ fn app(pool: PgPool, deployment_mode: DeploymentMode, enforcement_enabled: bool)
         oauth_config: None,
         billing: None,
         telemetry_ingest: false,
+        contact_verification: None,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,

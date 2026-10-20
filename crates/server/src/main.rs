@@ -177,6 +177,7 @@ async fn run() -> Result<()> {
         oauth,
         oauth_config: config.oauth.clone(),
         billing,
+        contact_verification: None,
         telemetry_ingest: config.telemetry.ingest_enabled,
         // One opt-in drives both halves: the routes that accept work and the worker that performs
         // it. Splitting them would let a deployment freeze organisations it can never purge.

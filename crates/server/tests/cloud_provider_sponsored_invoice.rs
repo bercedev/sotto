@@ -708,6 +708,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::Cloud,
         telemetry_ingest: false,
+        contact_verification: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,
