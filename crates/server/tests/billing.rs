@@ -109,6 +109,7 @@ fn app_with_billing_mode(
     let state = AppState {
         deployment_mode,
         telemetry_ingest: false,
+        contact_verification: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,
@@ -319,6 +320,7 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
+        contact_verification: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,

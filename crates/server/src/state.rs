@@ -7,6 +7,7 @@ use sqlx::PgPool;
 use crate::auth::OAuthProvider;
 use crate::billing::BillingState;
 use crate::config::{DeploymentMode, OAuthConfig};
+use crate::contact_verification::ContactVerificationService;
 
 /// Cloneable handle to the resources every request needs.
 ///
@@ -19,6 +20,8 @@ pub struct AppState {
     pub oauth: Option<Arc<dyn OAuthProvider>>,
     pub oauth_config: Option<OAuthConfig>,
     pub billing: Option<BillingState>,
+    /// Contact enrolment and verification transport. `None` keeps the feature unavailable.
+    pub contact_verification: Option<Arc<ContactVerificationService>>,
     /// Whether this instance accepts telemetry pings (`SOTTO_TELEMETRY_INGEST=1`, hosted only).
     pub telemetry_ingest: bool,
     /// Whether the organisation-deletion API is registered on this instance.

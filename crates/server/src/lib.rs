@@ -91,6 +91,8 @@ pub mod cloud_provider_stripe_sponsored_store;
 pub mod cloud_retention_lifecycle;
 pub mod community;
 pub mod config;
+pub mod contact_email;
+pub mod contact_verification;
 pub mod db;
 pub mod encoding;
 pub mod entitlements;
@@ -192,6 +194,7 @@ pub fn app(state: AppState) -> Router {
         })
         .merge(machine::router())
         .merge(notifications::router())
+        .merge(contact_verification::router())
         .merge(sync::router())
         .merge(share::router())
         .merge(server_info::router())

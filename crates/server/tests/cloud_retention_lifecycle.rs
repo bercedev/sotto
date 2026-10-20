@@ -50,6 +50,7 @@ fn state(pool: PgPool) -> AppState {
         oauth_config: None,
         billing: None,
         telemetry_ingest: false,
+        contact_verification: None,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: 30,
         organisation_deletion_metrics_token: None,

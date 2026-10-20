@@ -1154,6 +1154,25 @@ organisation whose purge has already begun. Existing operations keep their store
 deadline; the routes return `404` again and the worker stops advancing the queue, leaving frozen
 organisations frozen until deletion is re-enabled or an operator recovers them through the runbook.
 
+## Cloud lifecycle email contacts
+
+Contact enrolment is optional and independent of billing and vault access. Both
+`SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED` and `SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED` default to
+`0` and must be enabled together; the server rejects a partial configuration. Keep both off until
+the sender domain is authenticated and a test recipient has completed the full challenge flow.
+The server requires an HTTPS `SOTTO_WEB_ORIGIN`, a configured sender address, and the transport
+credential from the deployment secret store. Do not put the credential in a checked-in file or
+pass it on a command line.
+
+The contact endpoints let a signed-in user set, verify, view, and revoke their own lifecycle email
+address without unlocking the vault. Verification proves control of that address; it does not
+change billing, access, or export rights, and it does not mean future notices have been delivered.
+The verification callback token is one-use and short-lived. The server stores only its digest.
+
+To disable the journey, turn both flags off and restart the server. Existing verified contacts are
+retained, and users can still revoke their own contact. Re-enabling the flags does not resend an
+old challenge; the user starts a fresh verification request.
+
 ## Database security
 
 The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** - it

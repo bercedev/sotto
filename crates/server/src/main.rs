@@ -23,6 +23,8 @@ use sotto_server::cloud_provider_stripe_http::StripeReadLimits;
 #[cfg(not(feature = "e2e-mock-billing"))]
 use sotto_server::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
 use sotto_server::config::Config;
+use sotto_server::contact_email::ResendSender;
+use sotto_server::contact_verification::ContactVerificationService;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
 use sotto_server::state::AppState;
@@ -168,6 +170,36 @@ async fn run() -> Result<()> {
     // AppState owns billing; keep only the provider handle for the optional worker.
     let worker_provider = billing.as_ref().map(BillingState::provider);
 
+    let contact_verification = if config.contact_verification.enrolment_enabled
+        && config.contact_verification.email_sends_enabled
+    {
+        let sender = ResendSender::new(
+            config
+                .contact_verification
+                .resend_api_key
+                .clone()
+                .expect("contact email configuration validated at startup"),
+            config
+                .contact_verification
+                .from_address
+                .clone()
+                .expect("contact email configuration validated at startup"),
+        )?;
+        let origin = config
+            .contact_verification
+            .web_origin
+            .as_deref()
+            .expect("contact email configuration validated at startup");
+        Some(Arc::new(ContactVerificationService::new(
+            config.contact_verification.enrolment_enabled,
+            true,
+            origin,
+            Arc::new(sender),
+        )?))
+    } else {
+        None
+    };
+
     let repair_billing = billing.clone();
     let repair_runtime = personal_coverage_runtime.clone();
     let billing_transfer_operator_review_enabled = config.billing_transfer_operator_token.is_some();
@@ -177,6 +209,7 @@ async fn run() -> Result<()> {
         oauth,
         oauth_config: config.oauth.clone(),
         billing,
+        contact_verification,
         telemetry_ingest: config.telemetry.ingest_enabled,
         // One opt-in drives both halves: the routes that accept work and the worker that performs
         // it. Splitting them would let a deployment freeze organisations it can never purge.
@@ -199,6 +232,11 @@ async fn run() -> Result<()> {
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
     println!("cloud sales: {}", config.cloud_sales_enabled);
+    println!(
+        "cloud contact enrolment: {}, email sends: {}",
+        config.contact_verification.enrolment_enabled,
+        config.contact_verification.email_sends_enabled
+    );
     println!(
         "provider refresh: ingest={}, worker={}, reconciliation={}",
         config.provider_refresh_ingest_enabled,

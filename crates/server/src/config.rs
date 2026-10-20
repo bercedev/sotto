@@ -77,6 +77,9 @@ const BILLING_TRANSFER_SETUP_ENV: &str = "SOTTO_BILLING_TRANSFER_SETUP_ENABLED";
 const BILLING_TRANSFER_OPERATOR_TOKEN_ENV: &str = "SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN";
 const CLOUD_RETENTION_DRY_RUN_ENV: &str = "SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED";
 const CLOUD_RETENTION_OPERATOR_TOKEN_ENV: &str = "SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN";
+const CLOUD_CONTACT_ENROLMENT_ENV: &str = "SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED";
+const CLOUD_CONTACT_EMAIL_SEND_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED";
+const CLOUD_CONTACT_EMAIL_FROM_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_FROM";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -140,6 +143,17 @@ pub struct Config {
     pub cloud_retention_dry_run_enabled: bool,
     /// Dedicated bearer token for protected Cloud retention inspection and non-destructive actions.
     pub cloud_retention_operator_token: Option<String>,
+    /// Contact-enrolment and verification-email settings. Both switches default off.
+    pub contact_verification: ContactVerificationConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactVerificationConfig {
+    pub enrolment_enabled: bool,
+    pub email_sends_enabled: bool,
+    pub resend_api_key: Option<String>,
+    pub from_address: Option<String>,
+    pub web_origin: Option<String>,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -265,6 +279,18 @@ impl Config {
         let public_base_url =
             env_nonempty("SOTTO_PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
         let web_origin = env_nonempty("SOTTO_WEB_ORIGIN");
+        let contact_enrolment_enabled =
+            feature_flag_is_enabled(std::env::var(CLOUD_CONTACT_ENROLMENT_ENV).ok().as_deref());
+        let contact_email_sends_enabled =
+            feature_flag_is_enabled(std::env::var(CLOUD_CONTACT_EMAIL_SEND_ENV).ok().as_deref());
+        let contact_verification = ContactVerificationConfig {
+            enrolment_enabled: contact_enrolment_enabled,
+            email_sends_enabled: contact_email_sends_enabled,
+            resend_api_key: env_nonempty("RESEND_API_KEY"),
+            from_address: env_nonempty(CLOUD_CONTACT_EMAIL_FROM_ENV),
+            web_origin: web_origin.clone(),
+        };
+        validate_contact_verification_configuration(&contact_verification)?;
 
         let oauth = match (
             env_nonempty("GITHUB_CLIENT_ID"),
@@ -470,6 +496,7 @@ impl Config {
             billing_transfer_operator_token,
             cloud_retention_dry_run_enabled,
             cloud_retention_operator_token,
+            contact_verification,
         })
     }
 }
@@ -497,6 +524,64 @@ fn validate_founding_schedule_worker_configuration(
     if billing.cloud_portal_configuration_id.is_none() {
         return Err(Error::Config(
             "founding schedule worker requires STRIPE_CLOUD_PORTAL_CONFIGURATION_ID".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_contact_verification_configuration(config: &ContactVerificationConfig) -> Result<()> {
+    if config.enrolment_enabled && !config.email_sends_enabled {
+        return Err(Error::Config(
+            "SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED and SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED must be enabled together".into(),
+        ));
+    }
+    if !config.email_sends_enabled {
+        return Ok(());
+    }
+    let key = config.resend_api_key.as_deref().unwrap_or_default();
+    if !key.starts_with("re_") || key.len() < 8 || key.len() > 256 {
+        return Err(Error::Config(
+            "RESEND_API_KEY is required when contact email sends are enabled".into(),
+        ));
+    }
+    if !config.enrolment_enabled {
+        return Err(Error::Config(
+            "SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED requires SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED"
+                .into(),
+        ));
+    }
+    let from = config.from_address.as_deref().unwrap_or_default();
+    let valid_from = from.len() <= 320
+        && from.is_ascii()
+        && from.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && domain.contains('.')
+                && !from.chars().any(char::is_whitespace)
+        });
+    if !valid_from {
+        return Err(Error::Config(
+            "SOTTO_CLOUD_CONTACT_EMAIL_FROM must be a valid email address when sends are enabled"
+                .into(),
+        ));
+    }
+    let web_origin = config.web_origin.as_deref().unwrap_or_default();
+    let valid_origin = url::Url::parse(web_origin).is_ok_and(|origin| {
+        (origin.scheme() == "https"
+            || (origin.scheme() == "http"
+                && matches!(origin.host_str(), Some("localhost" | "127.0.0.1" | "::1"))))
+            && origin.host_str().is_some()
+            && origin.path() == "/"
+            && origin.query().is_none()
+            && origin.fragment().is_none()
+            && origin.username().is_empty()
+            && origin.password().is_none()
+    });
+    if !valid_origin {
+        return Err(Error::Config(
+            "SOTTO_WEB_ORIGIN must be an HTTPS origin when contact email sends are enabled".into(),
         ));
     }
     Ok(())
@@ -909,10 +994,10 @@ mod tests {
         telemetry_ping_enabled, validate_billing_transfer_execution_configuration,
         validate_billing_transfer_operator_configuration, validate_billing_transfers_configuration,
         validate_cloud_retention_configuration, validate_cloud_sales_configuration,
-        validate_coverage_authority_configuration, validate_deployment_billing_boundary,
-        validate_founding_price_notices_configuration,
+        validate_contact_verification_configuration, validate_coverage_authority_configuration,
+        validate_deployment_billing_boundary, validate_founding_price_notices_configuration,
         validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
-        BillingConfig, BillingPriceIds, DeploymentMode,
+        BillingConfig, BillingPriceIds, ContactVerificationConfig, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
         MAX_ORGANISATION_DELETION_RETENTION_DAYS, MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
     };
@@ -953,6 +1038,70 @@ mod tests {
         assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, true).is_err());
         assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, false).is_ok());
         assert!(validate_deployment_billing_boundary(DeploymentMode::Cloud, true).is_ok());
+    }
+
+    #[test]
+    fn contact_email_is_default_off_and_requires_a_complete_sender_configuration() {
+        assert!(
+            validate_contact_verification_configuration(&ContactVerificationConfig {
+                enrolment_enabled: false,
+                email_sends_enabled: false,
+                resend_api_key: None,
+                from_address: None,
+                web_origin: None,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_contact_verification_configuration(&ContactVerificationConfig {
+                enrolment_enabled: false,
+                email_sends_enabled: true,
+                resend_api_key: Some("re_12345678".into()),
+                from_address: Some("no-reply@example.test".into()),
+                web_origin: Some("https://app.example.test".into()),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_contact_verification_configuration(&ContactVerificationConfig {
+                enrolment_enabled: true,
+                email_sends_enabled: false,
+                resend_api_key: None,
+                from_address: None,
+                web_origin: None,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_contact_verification_configuration(&ContactVerificationConfig {
+                enrolment_enabled: true,
+                email_sends_enabled: true,
+                resend_api_key: None,
+                from_address: Some("no-reply@example.test".into()),
+                web_origin: Some("https://app.example.test".into()),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_contact_verification_configuration(&ContactVerificationConfig {
+                enrolment_enabled: true,
+                email_sends_enabled: true,
+                resend_api_key: Some("re_12345678".into()),
+                from_address: Some("no-reply@example.test".into()),
+                web_origin: Some("https://app.example.test".into()),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_contact_verification_configuration(&ContactVerificationConfig {
+                enrolment_enabled: true,
+                email_sends_enabled: true,
+                resend_api_key: Some("re_12345678".into()),
+                from_address: Some("no-reply@example.test".into()),
+                web_origin: Some("https://app.example.test/path".into()),
+            })
+            .is_err()
+        );
     }
 
     #[test]
