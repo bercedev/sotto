@@ -230,30 +230,27 @@ pub(crate) async fn load_view_with_revision(
     tx.commit().await?;
 
     let require_current_authority = state.cloud_coverage_authority_enforcement_enabled;
-    let authority_loaded = if require_current_authority {
+    let loaded_coverage = if require_current_authority {
         match crate::cloud_coverage_authority::load_current(&state.pool, user_id, epoch_now()).await
         {
             Ok(crate::cloud_coverage_authority::AuthorityState::Current { loaded, .. }) => {
-                Some(loaded)
+                Ok(loaded)
             }
-            Ok(
-                crate::cloud_coverage_authority::AuthorityState::Missing
-                | crate::cloud_coverage_authority::AuthorityState::Stale,
-            ) => None,
+            Ok(crate::cloud_coverage_authority::AuthorityState::Missing) => {
+                Err(StoreError::ProjectionMissing)
+            }
+            Ok(crate::cloud_coverage_authority::AuthorityState::Stale) => {
+                Err(StoreError::ProjectionUnavailable(
+                    crate::cloud_coverage_store::UnavailableReason::NeedsReconciliation,
+                ))
+            }
             Err(crate::cloud_coverage_authority::AuthorityError::Database(error)) => {
                 return Err(Error::Db(error))
             }
             Err(error) => return Err(Error::Internal(error.to_string())),
         }
     } else {
-        None
-    };
-    let loaded_coverage = match authority_loaded {
-        Some(loaded) => Ok(loaded),
-        None if require_current_authority => Err(StoreError::ProjectionUnavailable(
-            crate::cloud_coverage_store::UnavailableReason::NeedsReconciliation,
-        )),
-        None => cloud_coverage_store::load(&state.pool, user_id).await,
+        cloud_coverage_store::load(&state.pool, user_id).await
     };
     let (coverage, coverage_revision) = match loaded_coverage {
         Ok(loaded) => (

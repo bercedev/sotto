@@ -33,6 +33,15 @@ async fn pool_or_skip() -> Option<PgPool> {
 }
 
 fn app(pool: PgPool, deployment_mode: DeploymentMode, enforcement_enabled: bool) -> axum::Router {
+    app_with_authority_enforcement(pool, deployment_mode, enforcement_enabled, false)
+}
+
+fn app_with_authority_enforcement(
+    pool: PgPool,
+    deployment_mode: DeploymentMode,
+    enforcement_enabled: bool,
+    authority_enforcement_enabled: bool,
+) -> axum::Router {
     sotto_server::app(AppState {
         pool,
         deployment_mode,
@@ -46,7 +55,7 @@ fn app(pool: PgPool, deployment_mode: DeploymentMode, enforcement_enabled: bool)
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: None,
         cloud_action_enforcement_enabled: enforcement_enabled,
-        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: authority_enforcement_enabled,
         cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
@@ -55,6 +64,44 @@ fn app(pool: PgPool, deployment_mode: DeploymentMode, enforcement_enabled: bool)
         cloud_retention_dry_run_enabled: false,
         cloud_retention_operator_token: None,
     })
+}
+
+#[tokio::test]
+async fn missing_coverage_authority_keeps_new_cloud_accounts_free() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user_id = format!("new-free-user-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'github', $1)")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert free user without a coverage projection");
+    let token = session::issue(&pool, &user_id)
+        .await
+        .expect("issue session");
+    let response = app_with_authority_enforcement(pool.clone(), DeploymentMode::Cloud, false, true)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/account/eligibility")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("eligibility request"),
+        )
+        .await
+        .expect("eligibility response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("eligibility body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("eligibility JSON");
+    assert_eq!(value["state"], "free");
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean up free user");
 }
 
 async fn body_text(response: axum::response::Response) -> String {
