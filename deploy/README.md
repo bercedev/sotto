@@ -1272,6 +1272,14 @@ Stripe-hosted pages, and the webhook only assigns the org's tier.
 
 ## Operations
 
+The default-off `SOTTO_BILLING_RECOVERY_WORKER_ENABLED` retries interrupted personal Checkout
+creation from the stored offer, allocation, expiry and original Stripe idempotency key. It only
+creates or reopens the same Checkout session; payment and coverage still require the signed
+`invoice.paid` webhook. Retries stop before Stripe's documented idempotency-key pruning window, and
+ambiguous older operations are parked for review. This switch does not enable sales. Sponsored
+operation and refund recovery remain on their existing paths until their recovery workers are
+implemented and separately verified.
+
 ```sh
 docker compose -f docker-compose.prod.yml logs -f server   # API logs
 docker compose -f docker-compose.prod.yml logs -f caddy    # access/TLS logs

@@ -351,6 +351,18 @@ describe("CloudAccountPanel", () => {
     expect(screen.getByRole("button", { name: "Refresh payment status" })).toBeInTheDocument();
   });
 
+  it("warns when a pending checkout has been parked for manual review", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "pending_initial_payment" });
+    vi.mocked(api.fetchPersonalOperation).mockResolvedValue({
+      operationId: "operation-1", offer: "standard_monthly", state: "manual_review", checkoutUrl: null,
+    });
+    sessionStorage.setItem("sotto_personal_operation_id", "operation-1");
+
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/do not start another checkout/i);
+  });
+
   it("shows durable account notices without unlocking the vault", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "renewal_recovery", payer: "personal" });
     vi.mocked(api.createPersonalPortal).mockResolvedValue({
