@@ -280,7 +280,8 @@ pub async fn enqueue_in_tx(
     }
     let existing = sqlx::query(
         "SELECT subject_user_id, organisation_id, extract(epoch from deadline_at)::bigint AS deadline_epoch, notice_event_key, \
-                extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch, expected_coverage_revision \
+                extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch, expected_coverage_revision, \
+                state, dry_run, purge_enabled, job_id \
          FROM cloud_retention_jobs WHERE scope_kind=$1 AND scope_key=$2 \
            AND eligibility_episode=$3 FOR UPDATE",
     )
@@ -296,13 +297,56 @@ pub async fn enqueue_in_tx(
     let notice_event_key: String = existing.try_get("notice_event_key")?;
     let notice_evidence_epoch: Option<i64> = existing.try_get("notice_evidence_epoch")?;
     let expected_coverage_revision: Option<i64> = existing.try_get("expected_coverage_revision")?;
+    let state: String = existing.try_get("state")?;
+    let dry_run: bool = existing.try_get("dry_run")?;
+    let purge_enabled: bool = existing.try_get("purge_enabled")?;
+    let job_id: String = existing.try_get("job_id")?;
     if subject_user_id != intent.subject_user_id
         || organisation_id != intent.organisation_id
         || deadline_epoch != intent.deadline_epoch
         || notice_event_key != intent.notice_event_key
-        || expected_coverage_revision != intent.expected_coverage_revision
     {
         return Err(RetentionError::IdentityConflict);
+    }
+    if expected_coverage_revision != intent.expected_coverage_revision
+        && !matches!(state.as_str(), "cancelled" | "completed" | "failed")
+    {
+        // A coverage revision is an observation for an unfinished personal dry-run episode, not
+        // part of that episode's immutable identity. Requeue the recorded scope so every item is
+        // checked again against the new authority before the dry-run can complete.
+        if intent.scope_kind != ScopeKind::Personal
+            || !dry_run
+            || purge_enabled
+            || (expected_coverage_revision.is_some() && intent.expected_coverage_revision.is_none())
+        {
+            return Err(RetentionError::IdentityConflict);
+        }
+        let affected = sqlx::query(
+            "UPDATE cloud_retention_jobs SET expected_coverage_revision=$2, \
+                 state=CASE WHEN state='dry_run' OR (state='held' AND hold_code='coverage_revision_changed') \
+                            THEN 'ready' ELSE state END, \
+                 hold_code=CASE WHEN state='held' AND hold_code='coverage_revision_changed' \
+                                THEN NULL ELSE hold_code END, \
+                 dry_run_completed_at=CASE WHEN state='dry_run' \
+                       OR (state='held' AND hold_code='coverage_revision_changed') \
+                       THEN NULL ELSE dry_run_completed_at END, updated_at=now() \
+             WHERE job_id=$1 AND dry_run=TRUE AND purge_enabled=FALSE",
+        )
+        .bind(&job_id)
+        .bind(intent.expected_coverage_revision)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(RetentionError::IdentityConflict);
+        }
+        sqlx::query(
+            "UPDATE cloud_retention_scope_items SET state='planned', updated_at=now() \
+             WHERE job_id=$1 AND state='dry_run'",
+        )
+        .bind(&job_id)
+        .execute(&mut **tx)
+        .await?;
     }
     match (notice_evidence_epoch, intent.notice_evidence_epoch) {
         (Some(stored), Some(incoming)) if stored == incoming => {}

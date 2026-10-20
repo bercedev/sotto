@@ -17,6 +17,7 @@ use sotto_server::cloud_coverage_reconciliation::{
 };
 use sotto_server::config::DeploymentMode;
 use sotto_server::db;
+use sotto_server::retention::{self, EnqueueOutcome, RetentionIntent, ScopeKind};
 use sotto_server::state::AppState;
 
 fn test_lock() -> &'static Mutex<()> {
@@ -995,4 +996,108 @@ async fn bounded_scan_is_dark_until_enabled_and_persists_its_cursor() {
         assert!(scan_state.0.is_none());
     }
     cleanup(&pool, &user_id, &organisation_id).await;
+}
+
+#[tokio::test]
+async fn bounded_scan_holds_one_conflicted_user_and_continues_to_later_users() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4();
+    let failed_user = format!("!retention-scan-a-{suffix}");
+    let later_user = format!("!retention-scan-z-{suffix}");
+    let failed_org = format!("retention-scan-a-org-{suffix}");
+    let later_org = format!("retention-scan-z-org-{suffix}");
+    cleanup(&pool, &failed_user, &failed_org).await;
+    cleanup(&pool, &later_user, &later_org).await;
+    sqlx::query(
+        "INSERT INTO cloud_retention_scan_state(scan_key,cursor_user_id,lease_owner,lease_expires_at) \
+         VALUES('personal_expiry',NULL,NULL,NULL) ON CONFLICT(scan_key) DO UPDATE SET \
+         cursor_user_id=NULL,lease_owner=NULL,lease_expires_at=NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset the bounded scan cursor");
+
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch from now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    seed_user(&pool, &failed_user).await;
+    seed_user(&pool, &later_user).await;
+    let (failed_start, failed_deadline) = seed_expired_projection(&pool, &failed_user, now).await;
+    let (later_start, later_deadline) = seed_expired_projection(&pool, &later_user, now).await;
+    seed_notice(
+        &pool,
+        &failed_user,
+        failed_start,
+        failed_deadline,
+        failed_start - 60,
+    )
+    .await;
+    seed_notice(
+        &pool,
+        &later_user,
+        later_start,
+        later_deadline,
+        later_start - 60,
+    )
+    .await;
+    let failed_revision: i64 = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1",
+    )
+    .bind(&failed_user)
+    .fetch_one(&pool)
+    .await
+    .expect("read user's current revision");
+    let stale_intent = RetentionIntent {
+        job_id: format!("retention:stale-identity-{suffix}"),
+        scope_kind: ScopeKind::Personal,
+        scope_key: failed_user.clone(),
+        subject_user_id: Some(failed_user.clone()),
+        organisation_id: None,
+        eligibility_episode: format!("export-expiry:{failed_start}:{failed_deadline}"),
+        deadline_epoch: failed_deadline - 1,
+        notice_event_key: format!("cloud-export-window:{failed_start}:{failed_deadline}"),
+        notice_evidence_epoch: Some(failed_start),
+        expected_coverage_revision: Some(failed_revision),
+    };
+    assert_eq!(
+        retention::enqueue(&pool, &stale_intent)
+            .await
+            .expect("seed one conflicting immutable job identity"),
+        EnqueueOutcome::Enqueued
+    );
+
+    let state = state(pool.clone());
+    let scanned = sotto_server::cloud_retention_lifecycle::reconcile_once(&state)
+        .await
+        .expect("one user conflict must not abort the bounded scan");
+    assert!(scanned >= 2, "scan should reach both fixture users");
+    let held: (String, Option<String>) =
+        sqlx::query_as("SELECT state,hold_code FROM cloud_retention_jobs WHERE scope_key=$1")
+            .bind(&failed_user)
+            .fetch_one(&pool)
+            .await
+            .expect("read held conflicting candidate");
+    assert_eq!(held.0, "held");
+    assert_eq!(held.1.as_deref(), Some("reconciliation_failed"));
+    let later_job_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cloud_retention_jobs WHERE scope_key=$1)")
+            .bind(&later_user)
+            .fetch_one(&pool)
+            .await
+            .expect("read candidate after the failing user");
+    assert!(later_job_exists, "the scan must continue to the next user");
+
+    cleanup(&pool, &failed_user, &failed_org).await;
+    cleanup(&pool, &later_user, &later_org).await;
+    sqlx::query(
+        "UPDATE cloud_retention_scan_state SET cursor_user_id=NULL,lease_owner=NULL,lease_expires_at=NULL \
+         WHERE scan_key='personal_expiry'",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore the scan cursor");
 }

@@ -272,6 +272,7 @@ fn safe_reason(value: &str) -> &'static str {
         "operator_cancelled" => "operator_cancelled",
         "eligibility_unavailable" => "eligibility_unavailable",
         "coverage_resumed" => "coverage_resumed",
+        "reconciliation_failed" => "reconciliation_failed",
         "coverage_revision_changed" => "coverage_revision_changed",
         "coverage_revision_missing" => "coverage_revision_missing",
         "coverage_unavailable" => "coverage_unavailable",

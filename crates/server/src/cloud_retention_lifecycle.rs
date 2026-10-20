@@ -48,7 +48,18 @@ pub async fn reconcile_once(state: &AppState) -> Result<usize> {
     }
     for user_id in &users {
         refresh_scan_lease(&state.pool, &scan_owner).await?;
-        reconcile_user_at(state, user_id, now_epoch).await?;
+        if let Err(error) = reconcile_user_at(state, user_id, now_epoch).await {
+            eprintln!("Cloud retention scan could not reconcile one account: {error}");
+            if let Err(hold_error) =
+                hold_user_candidates(&state.pool, user_id, "reconciliation_failed").await
+            {
+                // Continue the bounded scan even if the fallback hold cannot be persisted. The
+                // durable cursor will wrap around and revisit this account on a later pass.
+                eprintln!(
+                    "Cloud retention scan could not persist a hold for one account: {hold_error}"
+                );
+            }
+        }
     }
     let next_cursor = (users.len() == USER_BATCH as usize)
         .then(|| users.last().cloned())
