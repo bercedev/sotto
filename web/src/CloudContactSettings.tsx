@@ -15,7 +15,7 @@ function message(error: unknown): string {
 
 /** Contact management is available on the signed-in Cloud page without unlocking the vault. */
 export function CloudContactSettings() {
-  const [status, setStatus] = useState<CloudContactStatus | "unsupported" | null>(null);
+  const [status, setStatus] = useState<CloudContactStatus | "unsupported" | "error" | null>(null);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -31,15 +31,18 @@ export function CloudContactSettings() {
         setStatus("unsupported");
         return;
       }
+      setStatus("error");
       setError(message(cause));
     }
   }
 
   useEffect(() => {
-    void refresh();
     const fragment = new URLSearchParams(window.location.hash.slice(1));
     const token = fragment.get("contact_token");
-    if (token === null) return;
+    if (token === null) {
+      void refresh();
+      return;
+    }
 
     // Remove the bearer-like one-use value from the visible URL and browser history before the
     // authenticated POST. The fragment is never sent in the HTTP request or Referer header.
@@ -47,10 +50,12 @@ export function CloudContactSettings() {
     setBusy(true);
     void confirmCloudContactVerification(token)
       .then(async (verified) => {
+        // Avoid racing this fresh status with a request started before confirmation.
+        await refresh();
         setNotice(verified ? "Email address verified." : "This verification link is invalid or has expired.");
-        if (verified) await refresh();
       })
-      .catch((cause) => {
+      .catch(async (cause) => {
+        await refresh();
         if (cause instanceof UnsupportedCloudContactError) {
           setNotice(cause.message);
         } else {
@@ -103,6 +108,7 @@ export function CloudContactSettings() {
       {notice !== null && <p role="status">{notice}</p>}
       {status === null ? <p className="muted" role="status">Checking contact settings…</p>
         : status === "unsupported" ? <p className="muted">Email contact settings require a newer Sotto server version.</p>
+        : status === "error" ? <><p className="muted">Contact settings could not be loaded.</p><button type="button" onClick={() => void refresh()}>Retry</button></>
         : <>
         {status.email === null
           ? <p>No verified email contact is set.</p>
