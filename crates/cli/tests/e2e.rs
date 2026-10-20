@@ -75,6 +75,8 @@ impl TestServer {
                     billing_transfers_enabled: false,
                     billing_transfer_execution_enabled: false,
                     billing_transfer_setup_enabled: false,
+                    cloud_notice_dispatch_enabled: false,
+                    resend_webhook_secret: None,
                     pool,
                     oauth: None,
                     oauth_config: None,
