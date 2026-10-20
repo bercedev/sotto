@@ -173,6 +173,11 @@ pub fn app(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let cloud_notice_ops = if state.cloud_retention_operator_token.is_some() {
+        notifications::operator_router()
+    } else {
+        Router::new()
+    };
     Router::new()
         .merge(health::router())
         .merge(auth::router())
@@ -187,6 +192,7 @@ pub fn app(state: AppState) -> Router {
         .merge(billing_transfer_setup)
         .merge(billing_transfer_ops)
         .merge(cloud_retention_ops)
+        .merge(cloud_notice_ops)
         .merge(if state.billing_transfer_operator_token.is_some() {
             founding_price_notices::operator_router()
         } else {

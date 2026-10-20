@@ -22,6 +22,10 @@ pub struct AppState {
     pub billing: Option<BillingState>,
     /// Contact enrolment and verification transport. `None` keeps the feature unavailable.
     pub contact_verification: Option<Arc<ContactVerificationService>>,
+    /// Whether bounded Cloud lifecycle email dispatch and its Resend callback are enabled.
+    pub cloud_notice_dispatch_enabled: bool,
+    /// Resend Svix signing secret; absent keeps provider feedback unavailable.
+    pub resend_webhook_secret: Option<String>,
     /// Whether this instance accepts telemetry pings (`SOTTO_TELEMETRY_INGEST=1`, hosted only).
     pub telemetry_ingest: bool,
     /// Whether the organisation-deletion API is registered on this instance.

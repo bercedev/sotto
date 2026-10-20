@@ -44,6 +44,8 @@ fn app_with_mode(pool: PgPool, deployment_mode: sotto_server::config::Deployment
         deployment_mode,
         telemetry_ingest: false,
         contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,

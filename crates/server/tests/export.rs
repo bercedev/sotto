@@ -43,6 +43,8 @@ fn app(pool: PgPool) -> axum::Router {
         billing: None,
         telemetry_ingest: false,
         contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days:
             sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,

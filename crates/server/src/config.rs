@@ -80,6 +80,8 @@ const CLOUD_RETENTION_OPERATOR_TOKEN_ENV: &str = "SOTTO_CLOUD_RETENTION_OPERATOR
 const CLOUD_CONTACT_ENROLMENT_ENV: &str = "SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED";
 const CLOUD_CONTACT_EMAIL_SEND_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED";
 const CLOUD_CONTACT_EMAIL_FROM_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_FROM";
+const CLOUD_NOTICE_DISPATCH_ENV: &str = "SOTTO_CLOUD_NOTICE_DISPATCH_ENABLED";
+const RESEND_WEBHOOK_SECRET_ENV: &str = "RESEND_WEBHOOK_SECRET";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -145,6 +147,10 @@ pub struct Config {
     pub cloud_retention_operator_token: Option<String>,
     /// Contact-enrolment and verification-email settings. Both switches default off.
     pub contact_verification: ContactVerificationConfig,
+    /// Whether the separate lifecycle-notice dispatcher starts. Defaults off.
+    pub cloud_notice_dispatch_enabled: bool,
+    /// Resend signing secret used to authenticate delivery feedback.
+    pub resend_webhook_secret: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +289,9 @@ impl Config {
             feature_flag_is_enabled(std::env::var(CLOUD_CONTACT_ENROLMENT_ENV).ok().as_deref());
         let contact_email_sends_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_CONTACT_EMAIL_SEND_ENV).ok().as_deref());
+        let cloud_notice_dispatch_enabled =
+            feature_flag_is_enabled(std::env::var(CLOUD_NOTICE_DISPATCH_ENV).ok().as_deref());
+        let resend_webhook_secret = env_nonempty(RESEND_WEBHOOK_SECRET_ENV);
         let contact_verification = ContactVerificationConfig {
             enrolment_enabled: contact_enrolment_enabled,
             email_sends_enabled: contact_email_sends_enabled,
@@ -291,6 +300,12 @@ impl Config {
             web_origin: web_origin.clone(),
         };
         validate_contact_verification_configuration(&contact_verification)?;
+        validate_notice_dispatch_configuration(
+            deployment_mode,
+            cloud_notice_dispatch_enabled,
+            &contact_verification,
+            resend_webhook_secret.as_deref(),
+        )?;
 
         let oauth = match (
             env_nonempty("GITHUB_CLIENT_ID"),
@@ -497,6 +512,8 @@ impl Config {
             cloud_retention_dry_run_enabled,
             cloud_retention_operator_token,
             contact_verification,
+            cloud_notice_dispatch_enabled,
+            resend_webhook_secret,
         })
     }
 }
@@ -582,6 +599,71 @@ fn validate_contact_verification_configuration(config: &ContactVerificationConfi
     if !valid_origin {
         return Err(Error::Config(
             "SOTTO_WEB_ORIGIN must be an HTTPS origin when contact email sends are enabled".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_notice_dispatch_configuration(
+    deployment_mode: DeploymentMode,
+    enabled: bool,
+    contact: &ContactVerificationConfig,
+    webhook_secret: Option<&str>,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if deployment_mode != DeploymentMode::Cloud {
+        return Err(Error::Config(
+            "Cloud notice dispatch is available only in cloud deployment mode".into(),
+        ));
+    }
+    let key = contact.resend_api_key.as_deref().unwrap_or_default();
+    if !key.starts_with("re_") || key.len() < 8 || key.len() > 256 {
+        return Err(Error::Config(
+            "RESEND_API_KEY is required when Cloud notice dispatch is enabled".into(),
+        ));
+    }
+    let from = contact.from_address.as_deref().unwrap_or_default();
+    let valid_from = from.len() <= 320
+        && from.is_ascii()
+        && from.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && domain.contains('.')
+                && !from.chars().any(char::is_whitespace)
+        });
+    if !valid_from {
+        return Err(Error::Config(
+            "SOTTO_CLOUD_CONTACT_EMAIL_FROM is required when Cloud notice dispatch is enabled"
+                .into(),
+        ));
+    }
+    let web_origin = contact.web_origin.as_deref().unwrap_or_default();
+    let valid_origin = url::Url::parse(web_origin).is_ok_and(|origin| {
+        (origin.scheme() == "https"
+            || (origin.scheme() == "http"
+                && matches!(origin.host_str(), Some("localhost" | "127.0.0.1" | "::1"))))
+            && origin.host_str().is_some()
+            && origin.path() == "/"
+            && origin.query().is_none()
+            && origin.fragment().is_none()
+            && origin.username().is_empty()
+            && origin.password().is_none()
+    });
+    if !valid_origin {
+        return Err(Error::Config(
+            "SOTTO_WEB_ORIGIN is required and must be an HTTPS origin when Cloud notice dispatch is enabled"
+                .into(),
+        ));
+    }
+    if !webhook_secret
+        .is_some_and(|secret| secret.starts_with("whsec_") && (16..=256).contains(&secret.len()))
+    {
+        return Err(Error::Config(
+            "RESEND_WEBHOOK_SECRET is required when Cloud notice dispatch is enabled".into(),
         ));
     }
     Ok(())
@@ -996,10 +1078,11 @@ mod tests {
         validate_cloud_retention_configuration, validate_cloud_sales_configuration,
         validate_contact_verification_configuration, validate_coverage_authority_configuration,
         validate_deployment_billing_boundary, validate_founding_price_notices_configuration,
-        validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
-        BillingConfig, BillingPriceIds, ContactVerificationConfig, DeploymentMode,
-        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
-        MAX_ORGANISATION_DELETION_RETENTION_DAYS, MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
+        validate_founding_schedule_worker_configuration, validate_notice_dispatch_configuration,
+        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds,
+        ContactVerificationConfig, DeploymentMode, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
+        MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
     };
 
     #[test]
@@ -1102,6 +1185,51 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn notice_dispatch_is_cloud_only_and_requires_authenticated_feedback() {
+        let contact = ContactVerificationConfig {
+            enrolment_enabled: false,
+            email_sends_enabled: false,
+            resend_api_key: Some("re_12345678".into()),
+            from_address: Some("no-reply@example.test".into()),
+            web_origin: None,
+        };
+        assert!(validate_notice_dispatch_configuration(
+            DeploymentMode::SelfHosted,
+            false,
+            &contact,
+            None
+        )
+        .is_ok());
+        assert!(validate_notice_dispatch_configuration(
+            DeploymentMode::SelfHosted,
+            true,
+            &contact,
+            Some("whsec_dGVzdHNlY3JldA==")
+        )
+        .is_err());
+        assert!(validate_notice_dispatch_configuration(
+            DeploymentMode::Cloud,
+            true,
+            &ContactVerificationConfig {
+                web_origin: Some("https://app.example.test".into()),
+                ..contact.clone()
+            },
+            None
+        )
+        .is_err());
+        assert!(validate_notice_dispatch_configuration(
+            DeploymentMode::Cloud,
+            true,
+            &ContactVerificationConfig {
+                web_origin: Some("https://app.example.test".into()),
+                ..contact.clone()
+            },
+            Some("whsec_dGVzdHNlY3JldA==")
+        )
+        .is_ok());
     }
 
     #[test]

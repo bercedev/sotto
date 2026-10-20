@@ -184,6 +184,11 @@ async fn run() -> Result<()> {
                 .from_address
                 .clone()
                 .expect("contact email configuration validated at startup"),
+            config
+                .contact_verification
+                .web_origin
+                .clone()
+                .expect("contact email configuration validated at startup"),
         )?;
         let origin = config
             .contact_verification
@@ -199,6 +204,27 @@ async fn run() -> Result<()> {
     } else {
         None
     };
+    let notice_sender = if config.cloud_notice_dispatch_enabled {
+        Some(ResendSender::new(
+            config
+                .contact_verification
+                .resend_api_key
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+            config
+                .contact_verification
+                .from_address
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+            config
+                .contact_verification
+                .web_origin
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+        )?)
+    } else {
+        None
+    };
 
     let repair_billing = billing.clone();
     let repair_runtime = personal_coverage_runtime.clone();
@@ -210,6 +236,11 @@ async fn run() -> Result<()> {
         oauth_config: config.oauth.clone(),
         billing,
         contact_verification,
+        cloud_notice_dispatch_enabled: config.cloud_notice_dispatch_enabled,
+        resend_webhook_secret: config
+            .cloud_notice_dispatch_enabled
+            .then(|| config.resend_webhook_secret.clone())
+            .flatten(),
         telemetry_ingest: config.telemetry.ingest_enabled,
         // One opt-in drives both halves: the routes that accept work and the worker that performs
         // it. Splitting them would let a deployment freeze organisations it can never purge.
@@ -236,6 +267,10 @@ async fn run() -> Result<()> {
         "cloud contact enrolment: {}, email sends: {}",
         config.contact_verification.enrolment_enabled,
         config.contact_verification.email_sends_enabled
+    );
+    println!(
+        "Cloud lifecycle notice email dispatch: {}",
+        config.cloud_notice_dispatch_enabled
     );
     println!(
         "provider refresh: ingest={}, worker={}, reconciliation={}",
@@ -346,6 +381,9 @@ async fn run() -> Result<()> {
     }
     if config.founding_price_notices_enabled {
         sotto_server::founding_price_notices::spawn(pool.clone());
+    }
+    if let Some(sender) = notice_sender {
+        sotto_server::notifications::spawn(pool.clone(), sender);
     }
     if config.billing_transfer_execution_enabled {
         let provider = worker_provider.as_ref().ok_or_else(|| {

@@ -28,6 +28,8 @@ fn app(pool: PgPool, ingest: bool) -> Router {
         billing: None,
         telemetry_ingest: ingest,
         contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,

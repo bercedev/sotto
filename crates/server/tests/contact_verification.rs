@@ -88,6 +88,8 @@ fn app(pool: PgPool, contact_verification: Arc<ContactVerificationService>) -> R
         oauth_config: None,
         billing: None,
         contact_verification: Some(contact_verification),
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         telemetry_ingest: false,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,

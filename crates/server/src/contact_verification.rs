@@ -109,6 +109,7 @@ pub struct ConfirmVerificationRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContactStatus {
     pub email: Option<VerifiedEmailView>,
+    pub latest_delivery: Option<EmailDeliveryView>,
     pub pending_expires_at_epoch: Option<i64>,
     pub enrolment_available: bool,
 }
@@ -118,6 +119,24 @@ pub struct VerifiedEmailView {
     pub contact_id: String,
     pub masked_destination: String,
     pub verified_at_epoch: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmailDeliveryState {
+    Queued,
+    Accepted,
+    DeliveryUnknown,
+    Delivered,
+    Failed,
+    Bounced,
+    Suppressed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EmailDeliveryView {
+    pub state: EmailDeliveryState,
+    pub updated_at_epoch: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -534,12 +553,28 @@ pub async fn confirm_verification(pool: &PgPool, user_id: &str, token: &str) -> 
         return Ok(false);
     }
     sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled',cancelled_at=now(),lease_owner=NULL, \
+             lease_expires_at=NULL,updated_at=now() \
+         WHERE recipient_user_id=$1 AND channel='email' AND contact_id<>$2 \
+           AND status IN ('pending','leased')",
+    )
+    .bind(user_id)
+    .bind(&contact_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "UPDATE cloud_contact_verification_challenges SET status='verified',verified_at=now() \
          WHERE challenge_id=$1",
     )
     .bind(challenge_id)
     .execute(&mut *tx)
     .await?;
+    crate::notifications::enqueue_current_for_verified_contact_in_tx(&mut tx, user_id, &contact_id)
+        .await
+        .map_err(|error| match error {
+            crate::notifications::NoticeError::Database(error) => Error::Db(error),
+            other => Error::Internal(other.to_string()),
+        })?;
     tx.commit().await?;
     Ok(true)
 }
@@ -560,6 +595,40 @@ pub async fn contact_status(pool: &PgPool, user_id: &str) -> Result<ContactStatu
         })
     })
     .transpose()?;
+    let latest_delivery = sqlx::query(
+        "SELECT status, extract(epoch FROM updated_at)::bigint AS updated_at \
+         FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+           AND channel='email' AND status <> 'cancelled' \
+         ORDER BY created_at DESC, notice_id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|row| {
+        let status: String = row.try_get("status")?;
+        let state = match status.as_str() {
+            "pending" | "leased" => EmailDeliveryState::Queued,
+            "accepted" => EmailDeliveryState::Accepted,
+            "delivery_unknown" => EmailDeliveryState::DeliveryUnknown,
+            "delivered" => EmailDeliveryState::Delivered,
+            "failed" => EmailDeliveryState::Failed,
+            "bounced" => EmailDeliveryState::Bounced,
+            "suppressed" => EmailDeliveryState::Suppressed,
+            // The database constraint protects this branch; keep the endpoint closed if a
+            // future migration adds a status without updating this public summary.
+            _ => {
+                return Err(sqlx::Error::ColumnDecode {
+                    index: "status".to_owned(),
+                    source: Box::new(std::io::Error::other("unknown email delivery status")),
+                })
+            }
+        };
+        Ok::<_, sqlx::Error>(EmailDeliveryView {
+            state,
+            updated_at_epoch: row.try_get("updated_at")?,
+        })
+    })
+    .transpose()?;
     // Keep the self-view response the same for usable and unavailable destinations. Otherwise a
     // caller could submit a known address and distinguish another account's active contact by
     // checking whether the request appears pending.
@@ -576,6 +645,7 @@ pub async fn contact_status(pool: &PgPool, user_id: &str) -> Result<ContactStatu
     .flatten();
     Ok(ContactStatus {
         email,
+        latest_delivery,
         pending_expires_at_epoch,
         enrolment_available: false,
     })
@@ -586,6 +656,14 @@ pub async fn revoke_verified_contact(pool: &PgPool, user_id: &str) -> Result<()>
     sqlx::query(
         "UPDATE cloud_verified_contacts SET revoked_at=now() \
          WHERE user_id=$1 AND channel='email' AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled',cancelled_at=now(),lease_owner=NULL, \
+             lease_expires_at=NULL,updated_at=now() \
+         WHERE recipient_user_id=$1 AND channel='email' AND status IN ('pending','leased')",
     )
     .bind(user_id)
     .execute(&mut *tx)

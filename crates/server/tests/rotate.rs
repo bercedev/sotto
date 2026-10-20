@@ -30,6 +30,8 @@ fn app(pool: PgPool) -> Router {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
         contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         cloud_action_enforcement_enabled: false,
         cloud_coverage_authority_enforcement_enabled: false,
         cloud_coverage_authority_shadow_enabled: false,

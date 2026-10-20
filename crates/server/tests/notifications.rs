@@ -119,6 +119,23 @@ fn eligibility_for(
 }
 
 async fn cleanup(pool: &PgPool, user_id: &str) {
+    sqlx::query(
+        "DELETE FROM cloud_notice_provider_events WHERE provider_message_id IN ( \
+         SELECT provider_message_id FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+           AND provider_message_id IS NOT NULL)",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("clean notification provider events");
+    sqlx::query(
+        "DELETE FROM cloud_notice_operator_actions WHERE notice_fingerprint IN ( \
+         SELECT operator_fingerprint FROM cloud_notice_outbox WHERE recipient_user_id=$1)",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("clean notification operator actions");
     sqlx::query("DELETE FROM cloud_notice_outbox WHERE recipient_user_id=$1")
         .bind(user_id)
         .execute(pool)
@@ -170,6 +187,7 @@ fn in_app_intent(user_id: &str, event_key: &str, due_at_epoch: i64) -> NoticeInt
         kind: NoticeKind::FailedRenewal,
         channel: NoticeChannel::InApp,
         contact_id: None,
+        scope_id: None,
         due_at_epoch,
         content: content(),
     }
@@ -792,6 +810,8 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             billing: None,
             telemetry_ingest: false,
             contact_verification: None,
+            cloud_notice_dispatch_enabled: false,
+            resend_webhook_secret: None,
             organisation_deletion_enabled: false,
             organisation_deletion_retention_days:
                 sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
@@ -996,6 +1016,386 @@ impl NoticeSender for RetrySender {
     }
 }
 
+struct AcceptedSender {
+    provider_message_id: &'static str,
+}
+
+#[async_trait]
+impl NoticeSender for AcceptedSender {
+    async fn send(&mut self, _delivery: notifications::NoticeDelivery) -> DeliveryOutcome {
+        DeliveryOutcome::Accepted {
+            provider_message_id: self.provider_message_id.into(),
+        }
+    }
+}
+
+struct CallbackBeforeAcceptanceSender {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl NoticeSender for CallbackBeforeAcceptanceSender {
+    async fn send(&mut self, _delivery: notifications::NoticeDelivery) -> DeliveryOutcome {
+        notifications::record_provider_event(
+            &self.pool,
+            "resend-event-before-acceptance",
+            "resend-message-before-acceptance",
+            "delivered",
+        )
+        .await
+        .expect("persist callback before provider response");
+        DeliveryOutcome::Accepted {
+            provider_message_id: "resend-message-before-acceptance".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn verified_contact_catches_up_current_notices_and_provider_delivery_is_deduplicated() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-email-catchup";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+
+    let earlier = in_app_intent(USER_ID, "event-catchup", now_epoch - 60);
+    notifications::enqueue(&pool, &earlier)
+        .await
+        .expect("enqueue in-app notice before contact verification");
+    notifications::record_verified_email(
+        &pool,
+        "contact-catchup",
+        USER_ID,
+        "catchup@example.test",
+        now_epoch,
+    )
+    .await
+    .expect("record verified contact");
+    let mut tx = pool.begin().await.expect("begin catch-up transaction");
+    assert_eq!(
+        notifications::enqueue_current_for_verified_contact_in_tx(
+            &mut tx,
+            USER_ID,
+            "contact-catchup"
+        )
+        .await
+        .expect("catch up current notices"),
+        1
+    );
+    assert_eq!(
+        notifications::enqueue_current_for_verified_contact_in_tx(
+            &mut tx,
+            USER_ID,
+            "contact-catchup"
+        )
+        .await
+        .expect("catch-up replay is idempotent"),
+        0
+    );
+    tx.commit().await.expect("commit catch-up");
+
+    let email_due: i64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM due_at)::bigint FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND event_key='event-catchup' AND channel='email'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load caught-up email");
+    assert_eq!(email_due, earlier.due_at_epoch);
+
+    let mut sender = AcceptedSender {
+        provider_message_id: "resend-message-catchup",
+    };
+    assert!(
+        notifications::run_once(&pool, "worker-catchup", &mut sender)
+            .await
+            .expect("send due caught-up email")
+    );
+    assert!(notifications::record_provider_event(
+        &pool,
+        "resend-event-delivered-catchup",
+        "resend-message-catchup",
+        "delivered"
+    )
+    .await
+    .expect("record delivery callback"));
+    assert!(!notifications::record_provider_event(
+        &pool,
+        "resend-event-delivered-catchup",
+        "resend-message-catchup",
+        "delivered"
+    )
+    .await
+    .expect("duplicate callback is ignored"));
+    let row = sqlx::query(
+        "SELECT status, provider_message_id, provider_delivered_at IS NOT NULL AS delivered \
+         FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+           AND event_key='event-catchup' AND channel='email'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load delivered email");
+    assert_eq!(row.get::<String, _>("status"), "delivered");
+    assert_eq!(
+        row.get::<String, _>("provider_message_id"),
+        "resend-message-catchup"
+    );
+    assert!(row.get::<bool, _>("delivered"));
+
+    let before_acceptance = in_app_intent(USER_ID, "event-before-acceptance", now_epoch - 45);
+    notifications::enqueue(&pool, &before_acceptance)
+        .await
+        .expect("enqueue callback-race notice");
+    let mut callback_sender = CallbackBeforeAcceptanceSender { pool: pool.clone() };
+    assert!(
+        notifications::run_once(&pool, "worker-callback-race", &mut callback_sender)
+            .await
+            .expect("send callback-race notice")
+    );
+    let callback_state: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND event_key='event-before-acceptance' AND channel='email'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load callback-race notice");
+    assert_eq!(callback_state, "delivered");
+
+    let next = in_app_intent(USER_ID, "event-after-catchup", now_epoch - 30);
+    notifications::enqueue(&pool, &next)
+        .await
+        .expect("enqueue the next lifecycle email");
+    assert!(notifications::record_provider_event(
+        &pool,
+        "resend-event-bounced-catchup",
+        "resend-message-catchup",
+        "bounced"
+    )
+    .await
+    .expect("record bounce callback"));
+    let suppressed: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND event_key='event-after-catchup' AND channel='email'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load suppressed email");
+    assert_eq!(suppressed, "suppressed");
+    let contact_revoked: bool = sqlx::query_scalar(
+        "SELECT revoked_at IS NOT NULL FROM cloud_verified_contacts WHERE contact_id='contact-catchup'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load bounced contact state");
+    assert!(contact_revoked);
+    let status = sotto_server::contact_verification::contact_status(&pool, USER_ID)
+        .await
+        .expect("read customer-safe email status");
+    assert!(status.email.is_none());
+    assert_eq!(
+        status.latest_delivery.unwrap().state,
+        sotto_server::contact_verification::EmailDeliveryState::Suppressed
+    );
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn operator_notice_controls_are_redacted_bounded_and_audited() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-operator-actions";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    notifications::record_verified_email(
+        &pool,
+        "contact-operator-actions",
+        USER_ID,
+        "private-person@example.test",
+        1_800_000_000,
+    )
+    .await
+    .expect("record verified contact");
+    for (event_key, policy_key) in [
+        ("private-event-retry", "private-policy-retry"),
+        ("private-event-suppress", "private-policy-suppress"),
+    ] {
+        notifications::enqueue(
+            &pool,
+            &NoticeIntent {
+                recipient_user_id: USER_ID.into(),
+                event_key: event_key.into(),
+                policy_key: policy_key.into(),
+                kind: NoticeKind::FailedRenewal,
+                channel: NoticeChannel::Email,
+                contact_id: Some("contact-operator-actions".into()),
+                scope_id: None,
+                due_at_epoch: 1,
+                content: content(),
+            },
+        )
+        .await
+        .expect("enqueue operator test email");
+    }
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='failed',attempt_count=6, \
+             last_error_code='provider_rejected_request' \
+         WHERE recipient_user_id=$1 AND event_key='private-event-retry' AND channel='email'",
+    )
+    .bind(USER_ID)
+    .execute(&pool)
+    .await
+    .expect("mark a rejected send for operator retry");
+
+    let state = AppState {
+        pool: pool.clone(),
+        deployment_mode: DeploymentMode::Cloud,
+        oauth: None,
+        oauth_config: None,
+        billing: None,
+        contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
+        telemetry_ingest: false,
+        organisation_deletion_enabled: false,
+        organisation_deletion_retention_days:
+            sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        organisation_deletion_metrics_token: None,
+        organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
+        cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: Some("notice-operator-test-token".into()),
+    };
+    let app = sotto_server::app(state);
+    let missing_auth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ops/cloud/notices")
+                .body(Body::empty())
+                .expect("build unauthorised operator request"),
+        )
+        .await
+        .expect("run unauthorised operator request");
+    assert_eq!(missing_auth.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ops/cloud/notices?limit=10")
+                .header("authorization", "Bearer notice-operator-test-token")
+                .body(Body::empty())
+                .expect("build operator listing request"),
+        )
+        .await
+        .expect("run operator listing request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read operator listing");
+    let listing: serde_json::Value = serde_json::from_slice(&body).expect("decode listing");
+    let rendered = listing.to_string();
+    assert!(!rendered.contains(USER_ID));
+    assert!(!rendered.contains("private-person@example.test"));
+    assert!(!rendered.contains("private-event"));
+    assert!(!rendered.contains("private-policy"));
+    let retry_fingerprint = listing["notices"]
+        .as_array()
+        .and_then(|notices| {
+            notices
+                .iter()
+                .find(|notice| notice["kind"] == "failed_renewal" && notice["status"] == "failed")
+        })
+        .and_then(|notice| notice["fingerprint"].as_str())
+        .expect("failed email has an opaque fingerprint")
+        .to_owned();
+    let suppress_fingerprint: String = sqlx::query_scalar(
+        "SELECT operator_fingerprint FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND event_key='private-event-suppress' AND channel='email'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load pending email fingerprint");
+
+    for (fingerprint, action) in [
+        (&retry_fingerprint, "retry"),
+        (&suppress_fingerprint, "suppress"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/ops/cloud/notices/{fingerprint}"))
+                    .header("authorization", "Bearer notice-operator-test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"operator":"reviewer", "action":action}).to_string(),
+                    ))
+                    .expect("build operator action request"),
+            )
+            .await
+            .expect("run operator action request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read operator action response");
+        let result: serde_json::Value = serde_json::from_slice(&body).expect("decode result");
+        assert_eq!(result["accepted"], true);
+    }
+    let rows = sqlx::query(
+        "SELECT event_key,status,attempt_count,operator_retry_count FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND channel='email' ORDER BY event_key",
+    )
+    .bind(USER_ID)
+    .fetch_all(&pool)
+    .await
+    .expect("load operated emails");
+    let retry = rows
+        .iter()
+        .find(|row| row.get::<String, _>("event_key") == "private-event-retry")
+        .expect("retried notice exists");
+    assert_eq!(retry.get::<String, _>("status"), "pending");
+    assert_eq!(retry.get::<i32, _>("attempt_count"), 0);
+    assert_eq!(retry.get::<i32, _>("operator_retry_count"), 1);
+    let suppressed = rows
+        .iter()
+        .find(|row| row.get::<String, _>("event_key") == "private-event-suppress")
+        .expect("suppressed notice exists");
+    assert_eq!(suppressed.get::<String, _>("status"), "suppressed");
+    let actions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_operator_actions WHERE notice_fingerprint IN ($1,$2) \
+         AND operator_label='reviewer' AND applied",
+    )
+    .bind(&retry_fingerprint)
+    .bind(&suppress_fingerprint)
+    .fetch_one(&pool)
+    .await
+    .expect("count operator audits");
+    assert_eq!(actions, 2);
+    cleanup(&pool, USER_ID).await;
+}
+
 #[tokio::test]
 async fn retry_keeps_lifecycle_due_date_and_records_provider_error() {
     let _guard = notification_test_lock().lock().await;
@@ -1017,10 +1417,11 @@ async fn retry_keeps_lifecycle_due_date_and_records_provider_error() {
     let intent = NoticeIntent {
         recipient_user_id: USER_ID.into(),
         event_key: "event-retry".into(),
-        policy_key: "price-change-v1".into(),
-        kind: NoticeKind::PriceChange,
+        policy_key: "recovery-v1".into(),
+        kind: NoticeKind::FailedRenewal,
         channel: NoticeChannel::Email,
         contact_id: Some("contact-retry".into()),
+        scope_id: None,
         due_at_epoch: 1,
         content: content(),
     };
@@ -1043,7 +1444,279 @@ async fn retry_keeps_lifecycle_due_date_and_records_provider_error() {
     assert_eq!(row.get::<i64, _>("due_at"), 1);
     assert_eq!(row.get::<String, _>("status"), "pending");
     assert_eq!(row.get::<i32, _>("attempt_count"), 1);
-    assert_eq!(row.get::<String, _>("last_error_code"), "provider_busy");
+    assert_eq!(row.get::<String, _>("last_error_code"), "provider_error");
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn future_email_is_not_claimed_and_missing_recovery_authority_is_held() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-authority-hold";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    notifications::record_verified_email(
+        &pool,
+        "contact-authority-hold",
+        USER_ID,
+        "authority-hold@example.test",
+        1_800_000_000,
+    )
+    .await
+    .expect("record verified contact");
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    let future = NoticeIntent {
+        recipient_user_id: USER_ID.into(),
+        event_key: "event-future-email".into(),
+        policy_key: "future-v1".into(),
+        kind: NoticeKind::CheckoutOutcome,
+        channel: NoticeChannel::Email,
+        contact_id: Some("contact-authority-hold".into()),
+        scope_id: None,
+        due_at_epoch: now_epoch + 3_600,
+        content: content(),
+    };
+    notifications::enqueue(&pool, &future)
+        .await
+        .expect("enqueue future email");
+    let mut sender = RetrySender;
+    assert!(
+        !notifications::run_once(&pool, "worker-authority-hold", &mut sender)
+            .await
+            .expect("future notice is not claimed early")
+    );
+
+    let recovery = NoticeIntent {
+        recipient_user_id: USER_ID.into(),
+        event_key: "event-recovery-authority".into(),
+        policy_key: "recovery-end-v1".into(),
+        kind: NoticeKind::RecoveryEnd,
+        channel: NoticeChannel::Email,
+        contact_id: Some("contact-authority-hold".into()),
+        scope_id: None,
+        due_at_epoch: now_epoch - 1,
+        content: content(),
+    };
+    notifications::enqueue(&pool, &recovery)
+        .await
+        .expect("enqueue recovery boundary");
+    assert!(
+        notifications::run_once(&pool, "worker-authority-hold", &mut sender)
+            .await
+            .expect("recovery notice is held while authority is missing")
+    );
+    let row = sqlx::query(
+        "SELECT status,last_error_code,provider_first_attempt_at IS NOT NULL AS attempted \
+         FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND event_key='event-recovery-authority'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load held recovery notice");
+    assert_eq!(row.get::<String, _>("status"), "pending");
+    assert_eq!(
+        row.get::<String, _>("last_error_code"),
+        "authority_unavailable"
+    );
+    assert!(!row.get::<bool, _>("attempted"));
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn scheduled_sponsorship_and_transfer_emails_require_live_matching_intents() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-scheduled-recipients";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    notifications::record_verified_email(
+        &pool,
+        "contact-scheduled-recipients",
+        USER_ID,
+        "scheduled@example.test",
+        now_epoch,
+    )
+    .await
+    .expect("record verified contact");
+    for (event_key, kind, policy_key) in [
+        (
+            "missing-sponsor-operation",
+            NoticeKind::SponsorshipChange,
+            "sponsorship-change-scheduled-v1",
+        ),
+        (
+            "missing-transfer",
+            NoticeKind::PayerTransferOutcome,
+            "payer-transfer-outcome-v1",
+        ),
+    ] {
+        let intent = NoticeIntent {
+            recipient_user_id: USER_ID.into(),
+            event_key: event_key.into(),
+            policy_key: policy_key.into(),
+            kind,
+            channel: NoticeChannel::Email,
+            contact_id: Some("contact-scheduled-recipients".into()),
+            scope_id: None,
+            due_at_epoch: now_epoch - 1,
+            content: content(),
+        };
+        notifications::enqueue(&pool, &intent)
+            .await
+            .expect("enqueue scheduled-event email");
+    }
+    let mut sender = RetrySender;
+    assert!(
+        notifications::run_once(&pool, "worker-scheduled-recipients", &mut sender)
+            .await
+            .expect("revalidate first scheduled email")
+    );
+    assert!(
+        notifications::run_once(&pool, "worker-scheduled-recipients", &mut sender)
+            .await
+            .expect("revalidate second scheduled email")
+    );
+    let suppressed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND event_key IN ('missing-sponsor-operation','missing-transfer') AND status='suppressed'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count stale scheduled emails");
+    assert_eq!(suppressed, 2);
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn sponsored_renewal_email_is_suppressed_after_admin_role_loss() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-admin-role-loss";
+    const ORGANIZATION_ID: &str = "notification-org-admin-role-loss";
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id=$1")
+        .bind(ORGANIZATION_ID)
+        .execute(&pool)
+        .await
+        .expect("clear prior sponsor subscription");
+    sqlx::query("DELETE FROM organizations WHERE id=$1")
+        .bind(ORGANIZATION_ID)
+        .execute(&pool)
+        .await
+        .expect("clear prior sponsor organisation");
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    notifications::record_verified_email(
+        &pool,
+        "contact-admin-role-loss",
+        USER_ID,
+        "admin@example.test",
+        now_epoch,
+    )
+    .await
+    .expect("record verified contact");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by, tier) VALUES ($1, $2, $3, 'team')",
+    )
+    .bind(ORGANIZATION_ID)
+    .bind(b"opaque".as_slice())
+    .bind(USER_ID)
+    .execute(&pool)
+    .await
+    .expect("seed sponsor organisation");
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id,user_id,role) VALUES ($1,$2,'owner')",
+    )
+    .bind(ORGANIZATION_ID)
+    .bind(USER_ID)
+    .execute(&pool)
+    .await
+    .expect("seed sponsor administrator");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id,provider_customer_id,provider_subscription_id,status) \
+         VALUES ($1,'cus_role_loss','sub_role_loss','past_due')",
+    )
+    .bind(ORGANIZATION_ID)
+    .execute(&pool)
+    .await
+    .expect("seed past-due sponsored subscription");
+    notifications::enqueue(
+        &pool,
+        &NoticeIntent {
+            recipient_user_id: USER_ID.into(),
+            event_key: "sponsored-renewal-v1:role-loss".into(),
+            policy_key: "sponsored-renewal-action-v1".into(),
+            kind: NoticeKind::SponsoredRenewalAction,
+            channel: NoticeChannel::Email,
+            contact_id: Some("contact-admin-role-loss".into()),
+            scope_id: Some(ORGANIZATION_ID.into()),
+            due_at_epoch: now_epoch - 1,
+            content: NoticeContent {
+                effective_at_epoch: Some(now_epoch - 30),
+                deadline_epoch: Some(now_epoch + 86_400),
+                ..content()
+            },
+        },
+    )
+    .await
+    .expect("enqueue sponsor administrator warning");
+    sqlx::query("UPDATE organization_memberships SET role='member' WHERE org_id=$1 AND user_id=$2")
+        .bind(ORGANIZATION_ID)
+        .bind(USER_ID)
+        .execute(&pool)
+        .await
+        .expect("remove sponsor administrator role");
+
+    let mut sender = RetrySender;
+    assert!(
+        notifications::run_once(&pool, "worker-admin-role-loss", &mut sender)
+            .await
+            .expect("stale administrator notice is suppressed")
+    );
+    let row = sqlx::query(
+        "SELECT status,last_error_code,provider_first_attempt_at IS NOT NULL AS attempted \
+         FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+           AND event_key='sponsored-renewal-v1:role-loss' AND channel='email'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load stale administrator notice");
+    assert_eq!(row.get::<String, _>("status"), "suppressed");
+    assert_eq!(
+        row.get::<String, _>("last_error_code"),
+        "notice_no_longer_current"
+    );
+    assert!(!row.get::<bool, _>("attempted"));
+
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id=$1")
+        .bind(ORGANIZATION_ID)
+        .execute(&pool)
+        .await
+        .expect("remove sponsor subscription");
+    sqlx::query("DELETE FROM organizations WHERE id=$1")
+        .bind(ORGANIZATION_ID)
+        .execute(&pool)
+        .await
+        .expect("remove sponsor organisation");
     cleanup(&pool, USER_ID).await;
 }
 
@@ -1096,7 +1769,7 @@ async fn deleted_contact_fails_queued_email_without_breaking_the_outbox_row() {
         &pool,
         "contact-deleted",
         USER_ID,
-        "person@example.test",
+        "deleted@example.test",
         1_800_000_000,
     )
     .await
@@ -1108,6 +1781,7 @@ async fn deleted_contact_fails_queued_email_without_breaking_the_outbox_row() {
         kind: NoticeKind::RecoveryEnd,
         channel: NoticeChannel::Email,
         contact_id: Some("contact-deleted".into()),
+        scope_id: None,
         due_at_epoch: 1,
         content: content(),
     };
