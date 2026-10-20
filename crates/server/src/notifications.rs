@@ -1763,6 +1763,87 @@ async fn notice_is_current(pool: &PgPool, lease: &NoticeLease) -> NoticeResult<O
     if !current {
         return Ok(Some(false));
     }
+    if lease.kind == "payer_transfer_invitation" {
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM cloud_notice_outbox notice \
+             JOIN billing_transfer_intents transfer ON transfer.transfer_id=notice.event_key \
+             WHERE notice.notice_id=$1 AND notice.recipient_user_id=$2 \
+               AND transfer.counterparty_user_id=notice.recipient_user_id \
+               AND transfer.state='awaiting_consent' \
+               AND transfer.consent_expires_at_epoch>extract(epoch FROM now())::bigint \
+               AND ( \
+                 ((transfer.source_kind='personal' AND transfer.actor_user_id=transfer.beneficiary_id) \
+                   OR (transfer.source_kind='sponsor' AND EXISTS ( \
+                     SELECT 1 FROM organization_memberships membership \
+                     JOIN organizations organization ON organization.id=membership.org_id \
+                     WHERE membership.org_id=transfer.source_organization_id \
+                       AND membership.user_id=transfer.actor_user_id \
+                       AND membership.role IN ('owner','admin') \
+                       AND organization.lifecycle_state='active'))) \
+                  AND ((transfer.destination_kind='personal' AND transfer.counterparty_user_id=transfer.beneficiary_id) \
+                    OR (transfer.destination_kind='sponsor' AND EXISTS ( \
+                      SELECT 1 FROM organization_memberships membership \
+                      JOIN organizations organization ON organization.id=membership.org_id \
+                      WHERE membership.org_id=transfer.destination_organization_id \
+                        AND membership.user_id=transfer.counterparty_user_id \
+                        AND membership.role IN ('owner','admin') \
+                        AND organization.lifecycle_state='active'))) \
+                  OR \
+                 ((transfer.destination_kind='personal' AND transfer.actor_user_id=transfer.beneficiary_id) \
+                   OR (transfer.destination_kind='sponsor' AND EXISTS ( \
+                     SELECT 1 FROM organization_memberships membership \
+                     JOIN organizations organization ON organization.id=membership.org_id \
+                     WHERE membership.org_id=transfer.destination_organization_id \
+                       AND membership.user_id=transfer.actor_user_id \
+                       AND membership.role IN ('owner','admin') \
+                       AND organization.lifecycle_state='active'))) \
+                  AND ((transfer.source_kind='personal' AND transfer.counterparty_user_id=transfer.beneficiary_id) \
+                    OR (transfer.source_kind='sponsor' AND EXISTS ( \
+                      SELECT 1 FROM organization_memberships membership \
+                      JOIN organizations organization ON organization.id=membership.org_id \
+                      WHERE membership.org_id=transfer.source_organization_id \
+                        AND membership.user_id=transfer.counterparty_user_id \
+                        AND membership.role IN ('owner','admin') \
+                        AND organization.lifecycle_state='active')))) \
+               AND ( \
+                 (transfer.source_kind='personal' AND EXISTS ( \
+                   SELECT 1 FROM billing_personal_accounts account \
+                   WHERE account.user_id=transfer.beneficiary_id AND account.state='active' \
+                     AND NOT account.cancel_at_period_end AND account.cancellation_requested_at IS NULL \
+                     AND account.paid_through_epoch=transfer.effective_from \
+                     AND account.stripe_subscription_id=transfer.source_provider_subscription_id)) \
+                 OR (transfer.source_kind='sponsor' AND EXISTS ( \
+                   SELECT 1 FROM billing_sponsored_seats seat \
+                   JOIN billing_sponsored_subscriptions subscription \
+                     ON subscription.organization_id=seat.organization_id \
+                   JOIN organizations organization ON organization.id=seat.organization_id \
+                   WHERE seat.organization_id=transfer.source_organization_id \
+                     AND seat.beneficiary_id=transfer.beneficiary_id AND seat.state='active' \
+                     AND seat.effective_from<=extract(epoch FROM now())::bigint \
+                     AND (seat.effective_until IS NULL OR seat.effective_until>=transfer.effective_from) \
+                     AND subscription.status='active' \
+                     AND subscription.current_period_end=transfer.effective_from \
+                     AND subscription.provider_subscription_id=transfer.source_provider_subscription_id \
+                     AND organization.lifecycle_state='active'))) \
+               AND ( \
+                 (transfer.destination_kind='personal' AND NOT EXISTS ( \
+                   SELECT 1 FROM billing_personal_accounts account \
+                   WHERE account.user_id=transfer.beneficiary_id \
+                     AND account.state IN ('pending','active','past_due','refund_required'))) \
+                 OR (transfer.destination_kind='sponsor' AND NOT EXISTS ( \
+                   SELECT 1 FROM billing_sponsored_seats seat \
+                   WHERE seat.organization_id=transfer.destination_organization_id \
+                     AND seat.beneficiary_id=transfer.beneficiary_id \
+                     AND seat.state IN ('pending','active','scheduled_removal')))))",
+        )
+        .bind(&lease.notice_id)
+        .bind(&lease.recipient_user_id)
+        .fetch_one(pool)
+        .await?;
+        if !current {
+            return Ok(Some(false));
+        }
+    }
     if lease.kind == "sponsorship_change" {
         let current: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM cloud_notice_outbox notice \

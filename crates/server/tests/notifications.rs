@@ -1721,6 +1721,224 @@ async fn sponsored_renewal_email_is_suppressed_after_admin_role_loss() {
 }
 
 #[tokio::test]
+async fn payer_transfer_invitation_is_suppressed_when_actor_loses_authority_after_claim() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let actor_id = format!("notification-transfer-actor-{suffix}");
+    let beneficiary_id = format!("notification-transfer-beneficiary-{suffix}");
+    let organization_id = format!("notification-transfer-source-{suffix}");
+    let subscription_id = format!("sub-notification-transfer-{suffix}");
+    let operation_id = format!("sponsored-notification-transfer-{suffix}");
+    let transfer_id = format!("transfer-notification-{suffix}");
+    let contact_id = format!("contact-notification-transfer-{suffix}");
+    let trigger_name = format!("notice_transfer_claim_{suffix}");
+    let function_name = format!("notice_transfer_claim_fn_{suffix}");
+    cleanup(&pool, &actor_id).await;
+    cleanup(&pool, &beneficiary_id).await;
+    seed_user(&pool, &actor_id).await;
+    seed_user(&pool, &beneficiary_id).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    let effective_from = now_epoch + 30 * 24 * 60 * 60;
+    notifications::record_verified_email(
+        &pool,
+        &contact_id,
+        &beneficiary_id,
+        &format!("transfer-beneficiary-{suffix}@example.test"),
+        now_epoch,
+    )
+    .await
+    .expect("record counterparty contact");
+    sqlx::query("INSERT INTO organizations (id,enc_name,created_by,tier) VALUES ($1,$2,$3,'team')")
+        .bind(&organization_id)
+        .bind(b"opaque".as_slice())
+        .bind(&actor_id)
+        .execute(&pool)
+        .await
+        .expect("seed source organisation");
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id,user_id,role) VALUES ($1,$2,'owner')",
+    )
+    .bind(&organization_id)
+    .bind(&actor_id)
+    .execute(&pool)
+    .await
+    .expect("seed source administrator");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id,provider_customer_id,provider_subscription_id,status,current_period_end) \
+         VALUES ($1,$2,$3,'active',$4)",
+    )
+    .bind(&organization_id)
+    .bind(format!("cus-{suffix}"))
+    .bind(&subscription_id)
+    .bind(effective_from)
+    .execute(&pool)
+    .await
+    .expect("seed active source subscription");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id,organization_id,actor_user_id,idempotency_key,request_hash,action, \
+          beneficiary_id,offer,quote_version,quote_expires_at_epoch,effective_from, \
+          provider_idempotency_key,provider_subscription_id,state,result_code) \
+         VALUES ($1,$2,$3,$4,$5,'add',$6,'standard_monthly',1,$7,$8,$9,$10,'active','completed')",
+    )
+    .bind(&operation_id)
+    .bind(&organization_id)
+    .bind(&actor_id)
+    .bind(format!("key-{suffix}"))
+    .bind(format!("hash-{suffix}"))
+    .bind(&beneficiary_id)
+    .bind(now_epoch + 900)
+    .bind(now_epoch - 60)
+    .bind(format!("provider-key-{suffix}"))
+    .bind(&subscription_id)
+    .execute(&pool)
+    .await
+    .expect("seed source seat operation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_seats \
+         (seat_id,organization_id,beneficiary_id,offer,effective_from,state,operation_id) \
+         VALUES ($1,$2,$3,'standard_monthly',$4,'active',$5)",
+    )
+    .bind(format!("seat-{suffix}"))
+    .bind(&organization_id)
+    .bind(&beneficiary_id)
+    .bind(now_epoch - 60)
+    .bind(&operation_id)
+    .execute(&pool)
+    .await
+    .expect("seed active source seat");
+    sqlx::query(
+        "INSERT INTO billing_transfer_intents \
+         (transfer_id,actor_user_id,counterparty_user_id,beneficiary_id,source_kind, \
+          source_organization_id,destination_kind,offer,quote_version,quote_expires_at_epoch, \
+          consent_expires_at_epoch,effective_from,idempotency_key,request_hash, \
+          provider_idempotency_key,source_provider_subscription_id,state) \
+         VALUES ($1,$2,$3,$3,'sponsor',$4,'personal','standard_monthly',1,$5,$6,$7,$8,$9,$10,$11,'awaiting_consent')",
+    )
+    .bind(&transfer_id)
+    .bind(&actor_id)
+    .bind(&beneficiary_id)
+    .bind(&organization_id)
+    .bind(now_epoch + 900)
+    .bind(now_epoch + 7 * 24 * 60 * 60)
+    .bind(effective_from)
+    .bind(format!("transfer-key-{suffix}"))
+    .bind(format!("transfer-hash-{suffix}"))
+    .bind(format!("transfer-provider-key-{suffix}"))
+    .bind(&subscription_id)
+    .execute(&pool)
+    .await
+    .expect("seed awaiting payer transfer");
+    notifications::enqueue(
+        &pool,
+        &NoticeIntent {
+            recipient_user_id: beneficiary_id.clone(),
+            event_key: transfer_id.clone(),
+            policy_key: "payer_transfer_invitation_v1".into(),
+            kind: NoticeKind::PayerTransferInvitation,
+            channel: NoticeChannel::Email,
+            contact_id: Some(contact_id),
+            scope_id: None,
+            due_at_epoch: now_epoch - 1,
+            content: NoticeContent {
+                title: "Payer transfer request".into(),
+                detail: "A payer transfer request is waiting for your review.".into(),
+                effective_at_epoch: Some(effective_from),
+                deadline_epoch: Some(now_epoch + 7 * 24 * 60 * 60),
+                amount_pence: Some(299),
+                price_interval: None,
+            },
+        },
+    )
+    .await
+    .expect("enqueue invitation email");
+
+    sqlx::query(&format!(
+        "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN UPDATE organization_memberships SET role='member' \
+         WHERE org_id='{organization_id}' AND user_id='{actor_id}'; RETURN NEW; END $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create scoped authority-change trigger function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER {trigger_name} AFTER UPDATE OF status ON cloud_notice_outbox \
+         FOR EACH ROW WHEN (NEW.status='leased' AND NEW.event_key='{transfer_id}') \
+         EXECUTE FUNCTION {function_name}()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create scoped authority-change trigger");
+
+    let mut sender = RetrySender;
+    let worker_result = notifications::run_once(&pool, "worker-transfer-invitation", &mut sender)
+        .await
+        .expect("suppress stale transfer invitation");
+    sqlx::query(&format!(
+        "DROP TRIGGER {trigger_name} ON cloud_notice_outbox"
+    ))
+    .execute(&pool)
+    .await
+    .expect("drop scoped authority-change trigger");
+    sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+        .execute(&pool)
+        .await
+        .expect("drop scoped authority-change function");
+    assert!(worker_result);
+    let row = sqlx::query(
+        "SELECT notice.status,notice.provider_first_attempt_at IS NOT NULL AS attempted, \
+                membership.role \
+         FROM cloud_notice_outbox notice \
+         JOIN organization_memberships membership ON membership.org_id=$2 AND membership.user_id=$3 \
+         WHERE notice.event_key=$1 AND notice.channel='email'",
+    )
+    .bind(&transfer_id)
+    .bind(&organization_id)
+    .bind(&actor_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load stale invitation after send preflight");
+    assert_eq!(row.get::<String, _>("status"), "suppressed");
+    assert!(!row.get::<bool, _>("attempted"));
+    assert_eq!(row.get::<String, _>("role"), "member");
+
+    sqlx::query("DELETE FROM billing_transfer_intents WHERE transfer_id=$1")
+        .bind(&transfer_id)
+        .execute(&pool)
+        .await
+        .expect("remove transfer fixture");
+    sqlx::query("DELETE FROM billing_sponsored_seats WHERE operation_id=$1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("remove source seat fixture");
+    sqlx::query("DELETE FROM billing_sponsored_operations WHERE operation_id=$1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("remove source operation fixture");
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id=$1")
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("remove source subscription fixture");
+    sqlx::query("DELETE FROM organizations WHERE id=$1")
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("remove source organisation fixture");
+    cleanup(&pool, &actor_id).await;
+    cleanup(&pool, &beneficiary_id).await;
+}
+
+#[tokio::test]
 async fn verified_contact_cannot_be_reassigned_to_another_user() {
     let _guard = notification_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
