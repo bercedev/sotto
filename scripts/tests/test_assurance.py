@@ -63,6 +63,19 @@ class AssuranceTests(unittest.TestCase):
         verdict = assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
         self.assertEqual(verdict["status"], "passed")
 
+    def test_queued_workflow_passes_only_when_required_jobs_pass(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["codec"]["required_jobs"]
+        payload = fixture("codec", names)
+        payload["run"]["status"] = "queued"
+
+        verdict = assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
+        self.assertEqual(verdict["status"], "passed")
+
+        payload["jobs"][0]["conclusion"] = None
+        with self.assertRaisesRegex(assurance.AssuranceError, "concluded None"):
+            assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
+
     def test_duplicate_and_unexpected_jobs_fail(self):
         manifest = assurance.load_manifest()
         names = manifest["groups"]["kani"]["required_jobs"]
