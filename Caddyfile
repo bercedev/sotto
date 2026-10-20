@@ -67,13 +67,31 @@ www.{$SOTTO_DOMAIN} {
 	# /orgs, /machine/*, …) is deliberately NOT limited: it is bearer-gated and includes
 	# high-frequency CI polling that a per-IP cap could wrongly throttle when a whole team shares
 	# one office/NAT egress IP. The threshold is a generous starting point - raise it, or split
-	# into per-endpoint zones, to taste.
+	# into per-endpoint zones, to taste. Contact-verification POSTs are the deliberate exception:
+	# their dedicated per-IP zone below complements account/destination limits in the application.
 	@ratelimited path /auth/github/* /shares /shares/* /community /telemetry/* /health/ready
 	handle @ratelimited {
 		rate_limit {
 			zone unauthenticated {
 				key {remote_host}
 				events 120
+				window 1m
+			}
+		}
+		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
+	}
+
+	# Verification sends are authenticated but can still be abused to generate provider traffic.
+	# Keep a dedicated per-IP ceiling in addition to the account/destination limits in Postgres.
+	@contact_verification {
+		method POST
+		path /account/contacts/verification /account/contacts/verification/confirm
+	}
+	handle @contact_verification {
+		rate_limit {
+			zone contact_verification {
+				key {remote_host}
+				events 20
 				window 1m
 			}
 		}
