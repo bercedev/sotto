@@ -2784,6 +2784,12 @@ async fn sponsored_checkout(
         )
         .await
         .map_err(Error::from)?;
+        crate::notifications::enqueue_sponsorship_change_in_tx(
+            &mut result_tx,
+            &operation.operation_id,
+        )
+        .await
+        .map_err(notification_error)?;
         result_tx.commit().await?;
         SponsoredOperationView {
             operation_id: operation.operation_id,
@@ -5215,7 +5221,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         None
     };
     if disposition == EventDisposition::Reconcile {
-        if is_sponsored_checkout_expired_event(&event) {
+        if is_checkout_expired_event(&event) {
             sponsored_checkout_expired(&mut tx, object).await?;
             mark_webhook_event_processed(&mut tx, &event.id).await?;
             tx.commit().await?;
@@ -8195,6 +8201,7 @@ async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) ->
                 kind: crate::notifications::NoticeKind::FailedRenewal,
                 channel: crate::notifications::NoticeChannel::InApp,
                 contact_id: None,
+                scope_id: None,
                 due_at_epoch,
                 content: crate::notifications::NoticeContent {
                     title: "Action needed for your Cloud renewal".into(),
@@ -8286,7 +8293,7 @@ async fn enqueue_personal_renewal_recovered_notice(
              lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
          WHERE recipient_user_id=$1 AND event_key=$2 \
            AND policy_key='personal-renewal-failure-v1' AND kind='failed_renewal' \
-           AND channel='in_app' AND status <> 'cancelled'",
+           AND status <> 'cancelled'",
     )
     .bind(&user_id)
     .bind(&event_key)
@@ -8307,6 +8314,7 @@ async fn enqueue_personal_renewal_recovered_notice(
         kind: crate::notifications::NoticeKind::RecoveryResolved,
         channel: crate::notifications::NoticeChannel::InApp,
         contact_id: None,
+        scope_id: None,
         due_at_epoch,
         content: crate::notifications::NoticeContent {
             title: "Your Cloud renewal is up to date".into(),
@@ -8346,6 +8354,7 @@ async fn enqueue_sponsored_renewal_failure_notices(
             kind: crate::notifications::NoticeKind::SponsoredRenewalFailure,
             channel: crate::notifications::NoticeChannel::InApp,
             contact_id: None,
+            scope_id: Some(organization_id.to_owned()),
             due_at_epoch,
             content: crate::notifications::NoticeContent {
                 title: "Your sponsored Cloud renewal needs attention".into(),
@@ -8386,6 +8395,7 @@ async fn enqueue_sponsored_renewal_failure_notices(
             kind: crate::notifications::NoticeKind::SponsoredRenewalAction,
             channel: crate::notifications::NoticeChannel::InApp,
             contact_id: None,
+            scope_id: Some(organization_id.to_owned()),
             due_at_epoch,
             content: crate::notifications::NoticeContent {
                 title: "Organisation Cloud renewal needs attention".into(),
@@ -8480,6 +8490,7 @@ async fn resolve_sponsored_renewal_failures(
             kind: crate::notifications::NoticeKind::RecoveryResolved,
             channel: crate::notifications::NoticeChannel::InApp,
             contact_id: None,
+            scope_id: None,
             due_at_epoch,
             content: crate::notifications::NoticeContent {
                 title: "Organisation Cloud renewal recovered".into(),
@@ -8746,6 +8757,14 @@ fn is_sponsored_checkout_expired_event(event: &Event) -> bool {
             .is_some_and(|reference| reference.starts_with("sponsored:"))
 }
 
+fn is_checkout_expired_event(event: &Event) -> bool {
+    is_sponsored_checkout_expired_event(event)
+        || (event.kind == "checkout.session.expired"
+            && event.data.object["client_reference_id"]
+                .as_str()
+                .is_some_and(|reference| reference.starts_with("personal:")))
+}
+
 async fn sponsored_checkout_expired(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
@@ -8756,12 +8775,85 @@ async fn sponsored_checkout_expired(
     let Some(reference) = object["client_reference_id"].as_str() else {
         return Ok(());
     };
+    if let Some(operation_id) = reference.strip_prefix("personal:") {
+        let user_id: Option<String> = sqlx::query_scalar(
+            "SELECT user_id FROM billing_personal_accounts WHERE operation_id=$1 AND state='pending'",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(user_id) = user_id {
+            crate::notifications::enqueue_checkout_outcome_in_tx(
+                tx,
+                &user_id,
+                operation_id,
+                crate::notifications::CheckoutOutcome::Expired,
+            )
+            .await
+            .map_err(notification_error)?;
+        }
+        return Ok(());
+    }
     let Some(operation_id) = reference.strip_prefix("sponsored:") else {
         return Ok(());
     };
-    sponsored_billing::cancel_failed_operation(tx, operation_id, "checkout_expired")
+    let operation =
+        sponsored_billing::cancel_failed_operation(tx, operation_id, "checkout_expired")
+            .await
+            .map_err(Error::from)?;
+    crate::notifications::enqueue_checkout_outcome_in_tx(
+        tx,
+        &operation.beneficiary_id,
+        operation_id,
+        crate::notifications::CheckoutOutcome::Expired,
+    )
+    .await
+    .map_err(notification_error)?;
+    if operation.actor_user_id != operation.beneficiary_id {
+        crate::notifications::enqueue_checkout_outcome_in_tx(
+            tx,
+            &operation.actor_user_id,
+            operation_id,
+            crate::notifications::CheckoutOutcome::Expired,
+        )
         .await
-        .map_err(Error::from)?;
+        .map_err(notification_error)?;
+    }
+    Ok(())
+}
+
+async fn enqueue_sponsored_checkout_outcome(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    outcome: crate::notifications::CheckoutOutcome,
+) -> Result<()> {
+    let recipients: Option<(String, String)> = sqlx::query_as(
+        "SELECT beneficiary_id,actor_user_id FROM billing_sponsored_operations WHERE operation_id=$1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((beneficiary_id, actor_user_id)) = recipients else {
+        return Ok(());
+    };
+    crate::notifications::enqueue_checkout_outcome_in_tx(
+        tx,
+        &beneficiary_id,
+        operation_id,
+        outcome,
+    )
+    .await
+    .map_err(notification_error)?;
+    if actor_user_id != beneficiary_id {
+        crate::notifications::enqueue_checkout_outcome_in_tx(
+            tx,
+            &actor_user_id,
+            operation_id,
+            outcome,
+        )
+        .await
+        .map_err(notification_error)?;
+    }
     Ok(())
 }
 
@@ -8840,11 +8932,29 @@ async fn checkout_completed(
         if record_sponsored_founding_award(tx, operation_id, &evidence, period_start, event_created)
             .await?
         {
+            enqueue_sponsored_checkout_outcome(
+                tx,
+                operation_id,
+                crate::notifications::CheckoutOutcome::Completed,
+            )
+            .await?;
+            crate::notifications::enqueue_sponsorship_change_in_tx(tx, operation_id)
+                .await
+                .map_err(notification_error)?;
             return Ok(());
         }
         sponsored_billing::complete_paid_checkout(tx, operation_id, &evidence)
             .await
             .map_err(Error::from)?;
+        enqueue_sponsored_checkout_outcome(
+            tx,
+            operation_id,
+            crate::notifications::CheckoutOutcome::Completed,
+        )
+        .await?;
+        crate::notifications::enqueue_sponsorship_change_in_tx(tx, operation_id)
+            .await
+            .map_err(notification_error)?;
         return Ok(());
     }
     let customer = object["customer"].as_str();
@@ -9027,6 +9137,14 @@ async fn personal_checkout_completed(
                     .await
                     .map_err(personal_billing_error)?;
                 }
+                crate::notifications::enqueue_checkout_outcome_in_tx(
+                    tx,
+                    &user_id,
+                    operation_id,
+                    crate::notifications::CheckoutOutcome::RefundRequired,
+                )
+                .await
+                .map_err(notification_error)?;
                 return Ok(());
             }
         }
@@ -9053,6 +9171,14 @@ async fn personal_checkout_completed(
         .await
         .map_err(personal_billing_error)?;
     }
+    crate::notifications::enqueue_checkout_outcome_in_tx(
+        tx,
+        &user_id,
+        operation_id,
+        crate::notifications::CheckoutOutcome::Completed,
+    )
+    .await
+    .map_err(notification_error)?;
     Ok(())
 }
 
@@ -9976,11 +10102,29 @@ async fn sponsored_invoice_paid(
         if record_sponsored_founding_award(tx, &operation_id, &evidence, period_start, paid_at)
             .await?
         {
+            enqueue_sponsored_checkout_outcome(
+                tx,
+                &operation_id,
+                crate::notifications::CheckoutOutcome::Completed,
+            )
+            .await?;
+            crate::notifications::enqueue_sponsorship_change_in_tx(tx, &operation_id)
+                .await
+                .map_err(notification_error)?;
             continue;
         }
         sponsored_billing::complete_paid_checkout(tx, &operation_id, &evidence)
             .await
             .map_err(Error::from)?;
+        enqueue_sponsored_checkout_outcome(
+            tx,
+            &operation_id,
+            crate::notifications::CheckoutOutcome::Completed,
+        )
+        .await?;
+        crate::notifications::enqueue_sponsorship_change_in_tx(tx, &operation_id)
+            .await
+            .map_err(notification_error)?;
     }
     Ok(Some(organization_id))
 }
