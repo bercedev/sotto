@@ -4974,7 +4974,9 @@ fn personal_checkout_status_from_object(
     }
     match (object["status"].as_str(), object["payment_status"].as_str()) {
         (Some("open"), Some("unpaid")) => Ok(PersonalCheckoutStatus::Open),
-        (Some("complete"), Some("unpaid" | "paid")) => Ok(PersonalCheckoutStatus::Complete),
+        (Some("complete"), Some("unpaid" | "paid" | "no_payment_required")) => {
+            Ok(PersonalCheckoutStatus::Complete)
+        }
         (Some("expired"), Some("unpaid")) => Ok(PersonalCheckoutStatus::ExpiredUnpaid),
         _ => Err(ProviderError::malformed_response()),
     }
@@ -14023,6 +14025,12 @@ mod tests {
         );
         let mut complete = open;
         complete["status"] = serde_json::json!("complete");
+        assert_eq!(
+            personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Complete
+        );
+        complete["payment_status"] = serde_json::json!("no_payment_required");
         assert_eq!(
             personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
                 .unwrap(),
