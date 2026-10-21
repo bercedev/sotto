@@ -1175,3 +1175,112 @@ async fn schedule_recovery_reads_back_the_exact_saved_update_before_replaying() 
 
     clean_recovery_fixture(&pool, &fixture).await;
 }
+
+#[tokio::test]
+async fn older_sponsored_schedule_recovery_is_parked_when_a_newer_write_exists() {
+    let _guard = TEST_LOCK.lock().await;
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let fixture = create_recovery_fixture(&pool, &Uuid::new_v4().to_string(), true).await;
+    let newer_beneficiary = format!("sponsored-recovery-new-beneficiary-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) \
+         VALUES ($1, 'sponsored-recovery-test', $1)",
+    )
+    .bind(&newer_beneficiary)
+    .execute(&pool)
+    .await
+    .expect("insert newer operation beneficiary");
+
+    let now = sotto_server::sponsored_billing::current_epoch();
+    let newer_request = SponsoredSeatRequest {
+        action: SponsoredSeatAction::Add,
+        beneficiary_id: newer_beneficiary.clone(),
+        replacement_beneficiary_id: None,
+        offer: BillingOffer::StandardMonthly,
+        quote_version: 1,
+        quote_expires_at_epoch: now + 600,
+        effective_from: now + 600,
+        effective_until: None,
+        idempotency_key: format!("newer-recovery-{}", Uuid::new_v4()),
+    };
+    let mut tx = pool.begin().await.expect("begin newer schedule operation");
+    let newer_operation = begin_operation(
+        &mut tx,
+        &fixture.organization_id,
+        &fixture.owner_id,
+        &newer_request,
+        now,
+    )
+    .await
+    .expect("create newer operation for the same sponsored subscription");
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET provider_subscription_id = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&newer_operation.operation_id)
+    .bind(&fixture.subscription_id)
+    .execute(&mut *tx)
+    .await
+    .expect("bind newer operation to the same provider subscription");
+    persist_provider_request(
+        &mut tx,
+        &newer_operation.operation_id,
+        &SponsoredProviderRequest::ScheduleUpdate {
+            organization_id: fixture.organization_id.clone(),
+            subscription_id: fixture.subscription_id.clone(),
+            expected_period_start: fixture.period_start,
+            expected_period_end: fixture.period_end,
+            phases: vec![sotto_server::billing::SponsoredSubscriptionPhase {
+                start_at_epoch: fixture.period_end,
+                end_at_epoch: None,
+                items: vec![SponsoredSubscriptionItemRequest {
+                    provider_price_id: "price_recovery_test".into(),
+                    quantity: 2,
+                }],
+            }],
+        },
+    )
+    .await
+    .expect("persist newer provider schedule request");
+    tx.commit().await.expect("commit newer schedule operation");
+
+    let provider = Arc::new(AppliedScheduleProvider {
+        subscription_id: fixture.subscription_id.clone(),
+        customer_id: fixture.customer_id.clone(),
+        schedule_id: fixture.schedule_id.clone(),
+        period_start: fixture.period_start,
+        period_end: fixture.period_end,
+        verification_calls: AtomicUsize::new(0),
+        update_calls: AtomicUsize::new(0),
+    });
+    let billing = BillingState::with_provider(
+        provider.clone(),
+        "whsec_test".into(),
+        "https://app.example.test".into(),
+    );
+
+    recover_sponsored_billing_operation_by_id(&pool, &billing, &fixture.operation_id)
+        .await
+        .expect("older schedule operation is parked instead of replayed");
+    assert_eq!(provider.verification_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.update_calls.load(Ordering::SeqCst), 0);
+    let (state, error_code): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, recovery_last_error_code FROM billing_sponsored_operations \
+         WHERE operation_id = $1",
+    )
+    .bind(&fixture.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read parked older operation");
+    assert_eq!(state, "manual_review");
+    assert_eq!(error_code.as_deref(), Some("superseded_by_newer_schedule"));
+
+    clean_recovery_fixture(&pool, &fixture).await;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&newer_beneficiary)
+        .execute(&pool)
+        .await
+        .expect("delete newer operation beneficiary after fixture cleanup");
+}

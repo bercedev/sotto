@@ -1,4 +1,7 @@
+CREATE SEQUENCE billing_sponsored_operation_generation_seq AS BIGINT;
+
 ALTER TABLE billing_sponsored_operations
+    ADD COLUMN provider_operation_generation BIGINT,
     ADD COLUMN provider_request_version SMALLINT,
     ADD COLUMN provider_request JSONB,
     ADD COLUMN provider_first_sent_at TIMESTAMPTZ,
@@ -40,6 +43,17 @@ ALTER TABLE billing_sponsored_operations
         NOT recovery_manual_review_required OR state = 'manual_review'
     );
 
+ALTER SEQUENCE billing_sponsored_operation_generation_seq
+    OWNED BY billing_sponsored_operations.provider_operation_generation;
+
+ALTER TABLE billing_sponsored_operations
+    ALTER COLUMN provider_operation_generation
+        SET DEFAULT nextval('billing_sponsored_operation_generation_seq');
+
+CREATE INDEX billing_sponsored_operations_provider_generation_idx
+    ON billing_sponsored_operations (provider_subscription_id, provider_operation_generation)
+    WHERE provider_request_version = 1 AND provider_request IS NOT NULL;
+
 CREATE INDEX billing_sponsored_operations_recovery_due_idx
     ON billing_sponsored_operations (recovery_next_attempt_at, updated_at, operation_id)
     WHERE state IN ('pending', 'unknown', 'checkout_created')
@@ -53,4 +67,4 @@ UPDATE billing_sponsored_operations
 SET state = 'manual_review', result_code = 'request_facts_missing',
     recovery_manual_review_required = TRUE, recovery_last_error_code = 'request_facts_missing',
     updated_at = now()
-WHERE state IN ('pending','unknown') AND provider_request IS NULL;
+WHERE state IN ('pending','unknown','checkout_created') AND provider_request IS NULL;

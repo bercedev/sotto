@@ -4084,92 +4084,168 @@ pub async fn recover_sponsored_billing_operation_by_id(
                 .map_err(Error::from)?;
                 return Ok(());
             }
-            match billing
-                .provider
-                .verify_sponsored_subscription_update(
+            with_sponsored_subscription_write_lock(pool, &subscription_id, async {
+                if sponsored_schedule_request_superseded(
+                    pool,
+                    &operation.operation_id,
                     &subscription_id,
-                    expected_period_start,
-                    expected_period_end,
-                    &phases,
                 )
-                .await
-            {
-                Ok(Some(snapshot)) => {
-                    record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
-                        .await?;
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    sponsored_billing::record_recovery_failure(
-                        pool,
-                        &operation.operation_id,
-                        &lease_token,
-                        sponsored_recovery_error_code(&error),
-                    )
-                    .await
-                    .map_err(Error::from)?;
-                    return Ok(());
-                }
-            }
-            match billing
-                .provider
-                .get_sponsored_subscription(&subscription_id)
-                .await
-            {
-                Ok(snapshot)
-                    if snapshot.current_period_start == Some(expected_period_start)
-                        && snapshot.current_period_end == Some(expected_period_end) => {}
-                Ok(_) => {
+                .await?
+                {
                     sponsored_billing::park_recovery_for_review(
                         pool,
                         &operation.operation_id,
                         &lease_token,
-                        "subscription_period_changed",
+                        "superseded_by_newer_schedule",
                     )
                     .await
                     .map_err(Error::from)?;
                     return Ok(());
                 }
-                Err(error) => {
-                    record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
-                        .await?;
+                match billing
+                    .provider
+                    .verify_sponsored_subscription_update(
+                        &subscription_id,
+                        expected_period_start,
+                        expected_period_end,
+                        &phases,
+                    )
+                    .await
+                {
+                    Ok(Some(snapshot)) => {
+                        record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
+                            .await?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        sponsored_billing::record_recovery_failure(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            sponsored_recovery_error_code(&error),
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        return Ok(());
+                    }
+                }
+                match billing
+                    .provider
+                    .get_sponsored_subscription(&subscription_id)
+                    .await
+                {
+                    Ok(snapshot)
+                        if snapshot.current_period_start == Some(expected_period_start)
+                            && snapshot.current_period_end == Some(expected_period_end) => {}
+                    Ok(_) => {
+                        sponsored_billing::park_recovery_for_review(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            "subscription_period_changed",
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                            .await?;
+                        return Ok(());
+                    }
+                }
+                if horizon_elapsed {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "provider_idempotency_window_elapsed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
                     return Ok(());
                 }
-            }
-            if horizon_elapsed {
-                sponsored_billing::park_recovery_for_review(
-                    pool,
-                    &operation.operation_id,
-                    &lease_token,
-                    "provider_idempotency_window_elapsed",
-                )
-                .await
-                .map_err(Error::from)?;
-                return Ok(());
-            }
-            match billing
-                .provider
-                .update_sponsored_subscription(
-                    &organization_id,
-                    &subscription_id,
-                    &phases,
-                    &operation.provider_idempotency_key,
-                )
-                .await
-            {
-                Ok(snapshot) => {
-                    record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
-                        .await?;
+                match billing
+                    .provider
+                    .update_sponsored_subscription(
+                        &organization_id,
+                        &subscription_id,
+                        &phases,
+                        &operation.provider_idempotency_key,
+                    )
+                    .await
+                {
+                    Ok(snapshot) => {
+                        record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
+                            .await?;
+                    }
+                    Err(error) => {
+                        record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                            .await?;
+                    }
                 }
-                Err(error) => {
-                    record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
-                        .await?;
-                }
-            }
+                Ok(())
+            })
+            .await?;
         }
     }
     Ok(())
+}
+
+pub(crate) async fn with_sponsored_subscription_write_lock<T, F>(
+    pool: &sqlx::PgPool,
+    subscription_id: &str,
+    operation: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let lock_name = format!("sponsored-subscription-write:{subscription_id}");
+    let mut connection = pool.acquire().await?;
+    // Closing this dedicated connection on drop also releases the session lock if the task is
+    // cancelled while a bounded provider request is in flight.
+    connection.close_on_drop();
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(&lock_name)
+        .execute(&mut *connection)
+        .await?;
+
+    let result = operation.await;
+    let unlocked =
+        sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&lock_name)
+            .fetch_one(&mut *connection)
+            .await;
+    match (result, unlocked) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Ok(false)) => Err(Error::Internal(
+            "sponsored subscription write lock was not held".into(),
+        )),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(value), Ok(true)) => Ok(value),
+    }
+}
+
+async fn sponsored_schedule_request_superseded(
+    pool: &sqlx::PgPool,
+    operation_id: &str,
+    subscription_id: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM billing_sponsored_operations current \
+         JOIN billing_sponsored_operations newer \
+           ON newer.provider_subscription_id = current.provider_subscription_id \
+          AND newer.provider_operation_generation > COALESCE(current.provider_operation_generation, 0) \
+         WHERE current.operation_id = $1 AND current.provider_subscription_id = $2 \
+           AND newer.provider_request_version = 1 \
+           AND newer.provider_request ->> 'kind' = 'schedule_update' \
+           AND newer.state <> 'failed')",
+    )
+    .bind(operation_id)
+    .bind(subscription_id)
+    .fetch_one(pool)
+    .await?)
 }
 
 async fn record_claimed_sponsored_update(
