@@ -6,8 +6,20 @@
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+use async_trait::async_trait;
+use sotto_server::billing::{
+    recover_sponsored_billing_operation_once, BillingState, ProviderError, ProviderErrorKind,
+    ProviderResult, SponsoredCheckoutSession, SponsoredSubscriptionItemRequest,
+    SubscriptionObservation, SubscriptionProvider,
+};
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
@@ -16,6 +28,388 @@ use sotto_server::sponsored_billing::{
     record_checkout, record_provider_update, record_recovery_failure, SponsoredBillingError,
     SponsoredProviderEvidence, SponsoredProviderRequest, SponsoredSeatAction, SponsoredSeatRequest,
 };
+
+struct LostResponseProvider {
+    customer_id: String,
+    session_id: String,
+    calls: AtomicUsize,
+    idempotency_keys: Mutex<Vec<String>>,
+    first_call_started: Notify,
+    release_first_call: Notify,
+}
+
+struct AppliedScheduleProvider {
+    subscription_id: String,
+    customer_id: String,
+    schedule_id: String,
+    period_start: i64,
+    period_end: i64,
+    verification_calls: AtomicUsize,
+    update_calls: AtomicUsize,
+}
+
+impl LostResponseProvider {
+    fn new(customer_id: String, session_id: String) -> Self {
+        Self {
+            customer_id,
+            session_id,
+            calls: AtomicUsize::new(0),
+            idempotency_keys: Mutex::new(Vec::new()),
+            first_call_started: Notify::new(),
+            release_first_call: Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl SubscriptionProvider for LostResponseProvider {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<String> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn create_sponsored_checkout(
+        &self,
+        _organization_id: &str,
+        _customer: Option<&str>,
+        _items: &[SponsoredSubscriptionItemRequest],
+        _operation_id: &str,
+        idempotency_key: &str,
+        _expires_at_epoch: i64,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<SponsoredCheckoutSession> {
+        self.idempotency_keys
+            .lock()
+            .expect("idempotency key lock")
+            .push(idempotency_key.to_owned());
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                self.first_call_started.notify_one();
+                self.release_first_call.notified().await;
+                Err(ProviderError {
+                    status: None,
+                    code: Some("transport_error".into()),
+                    kind: ProviderErrorKind::Retryable,
+                })
+            }
+            _ => Ok(SponsoredCheckoutSession {
+                session_id: self.session_id.clone(),
+                checkout_url: format!("https://checkout.stripe.test/{}", self.session_id),
+                customer_id: Some(self.customer_id.clone()),
+                subscription_id: None,
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl SubscriptionProvider for AppliedScheduleProvider {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<String> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(unsupported_provider_call())
+    }
+
+    async fn get_sponsored_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<sotto_server::billing::SponsoredSubscriptionSnapshot> {
+        assert_eq!(subscription_id, self.subscription_id);
+        Ok(self.snapshot())
+    }
+
+    async fn verify_sponsored_subscription_update(
+        &self,
+        subscription_id: &str,
+        expected_period_start: i64,
+        expected_period_end: i64,
+        phases: &[sotto_server::billing::SponsoredSubscriptionPhase],
+    ) -> ProviderResult<Option<sotto_server::billing::SponsoredSubscriptionSnapshot>> {
+        self.verification_calls.fetch_add(1, Ordering::SeqCst);
+        let expected_phases = [sotto_server::billing::SponsoredSubscriptionPhase {
+            start_at_epoch: self.period_end,
+            end_at_epoch: None,
+            items: vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_recovery_test".into(),
+                quantity: 1,
+            }],
+        }];
+        if subscription_id != self.subscription_id
+            || expected_period_start != self.period_start
+            || expected_period_end != self.period_end
+            || phases != expected_phases
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.snapshot()))
+    }
+
+    async fn update_sponsored_subscription(
+        &self,
+        _organization_id: &str,
+        _subscription_id: &str,
+        _phases: &[sotto_server::billing::SponsoredSubscriptionPhase],
+        _idempotency_key: &str,
+    ) -> ProviderResult<sotto_server::billing::SponsoredSubscriptionSnapshot> {
+        self.update_calls.fetch_add(1, Ordering::SeqCst);
+        Err(unsupported_provider_call())
+    }
+}
+
+impl AppliedScheduleProvider {
+    fn snapshot(&self) -> sotto_server::billing::SponsoredSubscriptionSnapshot {
+        sotto_server::billing::SponsoredSubscriptionSnapshot {
+            customer_id: Some(self.customer_id.clone()),
+            default_payment_method_id: None,
+            subscription_id: self.subscription_id.clone(),
+            status: sotto_server::billing::SubscriptionStatus::Active,
+            cancel_at_period_end: false,
+            cancel_at: None,
+            current_period_start: Some(self.period_start),
+            current_period_end: Some(self.period_end),
+            schedule_id: Some(self.schedule_id.clone()),
+            items: vec![],
+        }
+    }
+}
+
+fn unsupported_provider_call() -> ProviderError {
+    ProviderError {
+        status: None,
+        code: Some("unexpected_provider_call".into()),
+        kind: ProviderErrorKind::Unknown,
+    }
+}
+
+struct RecoveryFixture {
+    organization_id: String,
+    owner_id: String,
+    beneficiary_id: String,
+    operation_id: String,
+    customer_id: String,
+    session_id: String,
+    subscription_id: String,
+    schedule_id: String,
+    period_start: i64,
+    period_end: i64,
+}
+
+async fn create_recovery_fixture(
+    pool: &PgPool,
+    suffix: &str,
+    schedule_update: bool,
+) -> RecoveryFixture {
+    let organization_id = format!("sponsored-recovery-org-{suffix}");
+    let owner_id = format!("sponsored-recovery-owner-{suffix}");
+    let beneficiary_id = format!("sponsored-recovery-beneficiary-{suffix}");
+    let customer_id = format!("cus_recovery_{suffix}");
+    let session_id = format!("cs_recovery_{suffix}");
+    let subscription_id = format!("sub_recovery_{suffix}");
+    let schedule_id = format!("sched_recovery_{suffix}");
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES \
+         ($1, 'sponsored-recovery-test', $1), ($2, 'sponsored-recovery-test', $2)",
+    )
+    .bind(&owner_id)
+    .bind(&beneficiary_id)
+    .execute(pool)
+    .await
+    .expect("insert recovery users");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by) \
+         VALUES ($1, decode('6f7267', 'hex'), $2)",
+    )
+    .bind(&organization_id)
+    .bind(&owner_id)
+    .execute(pool)
+    .await
+    .expect("insert recovery organisation");
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id, user_id, role) \
+         VALUES ($1, $2, 'owner')",
+    )
+    .bind(&organization_id)
+    .bind(&owner_id)
+    .execute(pool)
+    .await
+    .expect("insert recovery owner membership");
+
+    let now = sotto_server::sponsored_billing::current_epoch();
+    let request = SponsoredSeatRequest {
+        action: SponsoredSeatAction::Add,
+        beneficiary_id: beneficiary_id.clone(),
+        replacement_beneficiary_id: None,
+        offer: BillingOffer::StandardMonthly,
+        quote_version: 1,
+        quote_expires_at_epoch: now + 600,
+        effective_from: now + 600,
+        effective_until: None,
+        idempotency_key: format!("recovery-{suffix}"),
+    };
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin sponsored recovery operation");
+    let operation = begin_operation(&mut tx, &organization_id, &owner_id, &request, now)
+        .await
+        .expect("create sponsored recovery operation");
+    let period_start = now - 3_600;
+    let period_end = now + 86_400;
+    let provider_request = if schedule_update {
+        sqlx::query(
+            "UPDATE billing_sponsored_operations SET provider_subscription_id = $2 WHERE operation_id = $1",
+        )
+        .bind(&operation.operation_id)
+        .bind(&subscription_id)
+        .execute(&mut *tx)
+        .await
+        .expect("bind schedule mutation to existing subscription");
+        SponsoredProviderRequest::ScheduleUpdate {
+            organization_id: organization_id.clone(),
+            subscription_id: subscription_id.clone(),
+            expected_period_start: period_start,
+            expected_period_end: period_end,
+            phases: vec![sotto_server::billing::SponsoredSubscriptionPhase {
+                start_at_epoch: period_end,
+                end_at_epoch: None,
+                items: vec![SponsoredSubscriptionItemRequest {
+                    provider_price_id: "price_recovery_test".into(),
+                    quantity: 1,
+                }],
+            }],
+        }
+    } else {
+        SponsoredProviderRequest::Checkout {
+            organization_id: organization_id.clone(),
+            customer_id: Some(customer_id.clone()),
+            items: vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_recovery_test".into(),
+                quantity: 1,
+            }],
+            expires_at_epoch: now + 3_600,
+            success_url: "https://example.test/success".into(),
+            cancel_url: "https://example.test/cancel".into(),
+        }
+    };
+    persist_provider_request(&mut tx, &operation.operation_id, &provider_request)
+        .await
+        .expect("persist immutable provider request");
+    tx.commit()
+        .await
+        .expect("commit sponsored recovery operation");
+
+    RecoveryFixture {
+        organization_id,
+        owner_id,
+        beneficiary_id,
+        operation_id: operation.operation_id,
+        customer_id,
+        session_id,
+        subscription_id,
+        schedule_id,
+        period_start,
+        period_end,
+    }
+}
+
+async fn clean_recovery_fixture(pool: &PgPool, fixture: &RecoveryFixture) {
+    sqlx::query("DELETE FROM billing_sponsored_subscription_items WHERE organization_id = $1")
+        .bind(&fixture.organization_id)
+        .execute(pool)
+        .await
+        .expect("delete recovery subscription items");
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id = $1")
+        .bind(&fixture.organization_id)
+        .execute(pool)
+        .await
+        .expect("delete recovery subscriptions");
+    sqlx::query("DELETE FROM billing_sponsored_seats WHERE organization_id = $1")
+        .bind(&fixture.organization_id)
+        .execute(pool)
+        .await
+        .expect("delete recovery seats");
+    sqlx::query("DELETE FROM billing_sponsored_operations WHERE organization_id = $1")
+        .bind(&fixture.organization_id)
+        .execute(pool)
+        .await
+        .expect("delete recovery operations");
+    sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1")
+        .bind(&fixture.organization_id)
+        .execute(pool)
+        .await
+        .expect("delete recovery membership");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(&fixture.organization_id)
+        .execute(pool)
+        .await
+        .expect("delete recovery organisation");
+    sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
+        .bind(&fixture.owner_id)
+        .bind(&fixture.beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete recovery users");
+}
 
 async fn pool() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -42,6 +436,7 @@ async fn pool() -> Option<PgPool> {
 
 #[tokio::test]
 async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
+    let _guard = TEST_LOCK.lock().await;
     let Some(pool) = pool().await else {
         return;
     };
@@ -290,6 +685,7 @@ async fn named_seat_operation_is_idempotent_and_activates_after_paid_result() {
 
 #[tokio::test]
 async fn sponsored_recovery_replays_immutable_request_under_a_fenced_lease() {
+    let _guard = TEST_LOCK.lock().await;
     let Some(pool) = pool().await else {
         return;
     };
@@ -496,7 +892,7 @@ async fn sponsored_recovery_replays_immutable_request_under_a_fenced_lease() {
     .bind(&operation.operation_id)
     .fetch_one(&pool)
     .await
-    .expect("read canceled checkout operation");
+    .expect("read cancelled checkout operation");
     assert_eq!(failed_state, "failed");
 
     sqlx::query("DELETE FROM billing_sponsored_seats WHERE organization_id = $1")
@@ -525,4 +921,218 @@ async fn sponsored_recovery_replays_immutable_request_under_a_fenced_lease() {
         .execute(&pool)
         .await
         .expect("delete users");
+}
+
+#[tokio::test]
+async fn sponsored_recovery_replays_same_checkout_after_lost_response_and_serialises_workers() {
+    let _guard = TEST_LOCK.lock().await;
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let fixture = create_recovery_fixture(&pool, &Uuid::new_v4().to_string(), false).await;
+    let provider = Arc::new(LostResponseProvider::new(
+        fixture.customer_id.clone(),
+        fixture.session_id.clone(),
+    ));
+    let billing = BillingState::with_provider(
+        provider.clone(),
+        "whsec_test".into(),
+        "https://app.example.test".into(),
+    );
+
+    let first_pool = pool.clone();
+    let first_billing = billing.clone();
+    let first_worker = tokio::spawn(async move {
+        recover_sponsored_billing_operation_once(&first_pool, &first_billing).await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.first_call_started.notified(),
+    )
+    .await
+    .expect("first provider call started while holding the recovery lease");
+
+    assert!(
+        !recover_sponsored_billing_operation_once(&pool, &billing)
+            .await
+            .expect("second worker sees the active lease"),
+        "a second worker must not send the same provider operation concurrently"
+    );
+    provider.release_first_call.notify_one();
+    assert!(first_worker
+        .await
+        .expect("join first worker")
+        .expect("first worker records the retryable response loss"));
+
+    let failed_attempts: i32 = sqlx::query_scalar(
+        "SELECT recovery_attempt_count FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(&fixture.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read retry count after lost response");
+    assert_eq!(failed_attempts, 1);
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET recovery_next_attempt_at = now() \
+         WHERE operation_id = $1",
+    )
+    .bind(&fixture.operation_id)
+    .execute(&pool)
+    .await
+    .expect("make idempotent replay due");
+
+    assert!(recover_sponsored_billing_operation_once(&pool, &billing)
+        .await
+        .expect("replay original provider request"));
+    let operation = sotto_server::sponsored_billing::load_operation_for_actor(
+        &pool,
+        &fixture.operation_id,
+        &fixture.owner_id,
+    )
+    .await
+    .expect("load operation after response-loss recovery")
+    .expect("actor can read its operation");
+    assert_eq!(operation.state, "checkout_created");
+    assert_eq!(
+        operation.provider_checkout_session_id.as_deref(),
+        Some(fixture.session_id.as_str())
+    );
+    let keys = provider
+        .idempotency_keys
+        .lock()
+        .expect("read captured provider idempotency keys")
+        .clone();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], keys[1], "recovery must replay the stored key");
+
+    let (first_claim, second_claim) = tokio::join!(
+        claim_recovery(&pool, &fixture.operation_id, "concurrent:one"),
+        claim_recovery(&pool, &fixture.operation_id, "concurrent:two")
+    );
+    let first_claim = first_claim.expect("first concurrent claim");
+    let second_claim = second_claim.expect("second concurrent claim");
+    assert_ne!(
+        first_claim.is_some(),
+        second_claim.is_some(),
+        "exactly one concurrent worker may own a recovery lease"
+    );
+
+    clean_recovery_fixture(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn paid_checkout_settlement_wins_against_an_in_flight_recovery_attempt() {
+    let _guard = TEST_LOCK.lock().await;
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let fixture = create_recovery_fixture(&pool, &Uuid::new_v4().to_string(), false).await;
+    let provider = Arc::new(LostResponseProvider::new(
+        fixture.customer_id.clone(),
+        fixture.session_id.clone(),
+    ));
+    let billing = BillingState::with_provider(
+        provider.clone(),
+        "whsec_test".into(),
+        "https://app.example.test".into(),
+    );
+
+    let worker_pool = pool.clone();
+    let worker_billing = billing.clone();
+    let worker = tokio::spawn(async move {
+        recover_sponsored_billing_operation_once(&worker_pool, &worker_billing).await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.first_call_started.notified(),
+    )
+    .await
+    .expect("provider call is in flight under a recovery lease");
+
+    let evidence = SponsoredProviderEvidence {
+        customer_id: Some(fixture.customer_id.clone()),
+        subscription_id: fixture.subscription_id.clone(),
+        schedule_id: None,
+        checkout_session_id: Some(fixture.session_id.clone()),
+        payment_reference: "pi_paid_webhook".into(),
+        provider_item_id: None,
+    };
+    let mut tx = pool.begin().await.expect("begin paid webhook settlement");
+    complete_paid_checkout(&mut tx, &fixture.operation_id, &evidence)
+        .await
+        .expect("paid checkout evidence settles despite the recovery lease");
+    tx.commit().await.expect("commit paid webhook settlement");
+
+    provider.release_first_call.notify_one();
+    let worker_result = worker.await.expect("join recovery worker");
+    assert!(worker_result.is_ok());
+    let operation = sotto_server::sponsored_billing::load_operation_for_actor(
+        &pool,
+        &fixture.operation_id,
+        &fixture.owner_id,
+    )
+    .await
+    .expect("load operation after webhook settlement")
+    .expect("actor can read its operation");
+    assert_eq!(operation.state, "active");
+    assert_eq!(
+        operation.provider_payment_reference.as_deref(),
+        Some("pi_paid_webhook")
+    );
+    assert_eq!(
+        operation.provider_checkout_session_id.as_deref(),
+        Some(fixture.session_id.as_str())
+    );
+    assert_eq!(operation.recovery_lease_token, None);
+    assert_eq!(operation.recovery_attempt_count, 0);
+
+    clean_recovery_fixture(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn schedule_recovery_reads_back_the_exact_saved_update_before_replaying() {
+    let _guard = TEST_LOCK.lock().await;
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let fixture = create_recovery_fixture(&pool, &Uuid::new_v4().to_string(), true).await;
+    let provider = Arc::new(AppliedScheduleProvider {
+        subscription_id: fixture.subscription_id.clone(),
+        customer_id: fixture.customer_id.clone(),
+        schedule_id: fixture.schedule_id.clone(),
+        period_start: fixture.period_start,
+        period_end: fixture.period_end,
+        verification_calls: AtomicUsize::new(0),
+        update_calls: AtomicUsize::new(0),
+    });
+    let billing = BillingState::with_provider(
+        provider.clone(),
+        "whsec_test".into(),
+        "https://app.example.test".into(),
+    );
+
+    assert!(recover_sponsored_billing_operation_once(&pool, &billing)
+        .await
+        .expect("recover already-applied schedule mutation"));
+    assert_eq!(provider.verification_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        provider.update_calls.load(Ordering::SeqCst),
+        0,
+        "read-back evidence avoids replaying an already-applied schedule update"
+    );
+    let operation = sotto_server::sponsored_billing::load_operation_for_actor(
+        &pool,
+        &fixture.operation_id,
+        &fixture.owner_id,
+    )
+    .await
+    .expect("load recovered schedule operation")
+    .expect("actor can read its operation");
+    assert_eq!(operation.state, "provider_pending");
+    assert_eq!(
+        operation.provider_subscription_id.as_deref(),
+        Some(fixture.subscription_id.as_str())
+    );
+
+    clean_recovery_fixture(&pool, &fixture).await;
 }
