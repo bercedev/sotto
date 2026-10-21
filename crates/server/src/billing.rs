@@ -24,7 +24,6 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use uuid::Uuid;
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -175,49 +174,6 @@ fn provider_failure_is_definitive(error: &ProviderError) -> bool {
         && error.kind != ProviderErrorKind::Retryable
 }
 
-async fn fail_sponsored_provider_operation(
-    pool: &sqlx::PgPool,
-    operation_id: &str,
-    result_code: &str,
-) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    founding_allocator::lock_capacity(&mut tx)
-        .await
-        .map_err(|error| Error::Internal(error.to_string()))?;
-    sponsored_billing::cancel_failed_operation(&mut tx, operation_id, result_code)
-        .await
-        .map_err(Error::from)?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn rotate_sponsored_provider_retry_key(
-    pool: &sqlx::PgPool,
-    operation_id: &str,
-    current_key: &str,
-) -> Result<()> {
-    // Updating a subscription schedule replaces the complete desired phase set, so an ambiguous
-    // outcome can be retried with a fresh provider key without duplicating a charge or a resource.
-    let operation_hash: String = Sha256::digest(operation_id.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let next_key = format!(
-        "sotto-sponsored:{operation_hash}-retry-{}",
-        Uuid::new_v4().simple()
-    );
-    sqlx::query(
-        "UPDATE billing_sponsored_operations SET provider_idempotency_key = $3, updated_at = now() \
-         WHERE operation_id = $1 AND state = 'pending' AND provider_idempotency_key = $2",
-    )
-    .bind(operation_id)
-    .bind(current_key)
-    .bind(next_key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let code = self.code.as_deref().unwrap_or("unknown_error");
@@ -297,21 +253,21 @@ pub enum SubscriptionObservation {
 }
 
 /// One price-class quantity on the organisation's sponsored subscription.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SponsoredSubscriptionItem {
     pub provider_item_id: String,
     pub provider_price_id: String,
     pub quantity: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SponsoredSubscriptionItemRequest {
     pub provider_price_id: String,
     pub quantity: i64,
 }
 
 /// A bounded or open-ended future phase for the organisation's sponsored subscription.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SponsoredSubscriptionPhase {
     pub start_at_epoch: i64,
     pub end_at_epoch: Option<i64>,
@@ -566,6 +522,14 @@ pub trait SubscriptionProvider: Send + Sync {
         Err(ProviderError::unsupported("personal_checkout_lookup"))
     }
 
+    async fn get_sponsored_checkout_status(
+        &self,
+        _session_id: &str,
+        _operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        Err(ProviderError::unsupported("sponsored_checkout_lookup"))
+    }
+
     /// Create the initial named sponsored subscription checkout. All price classes are sent in
     /// one Checkout Session so an organisation receives one subscription and one invoice.
     #[allow(clippy::too_many_arguments)]
@@ -594,6 +558,18 @@ pub trait SubscriptionProvider: Send + Sync {
         _idempotency_key: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
         Err(ProviderError::unsupported("sponsored_subscription_update"))
+    }
+
+    /// Confirm whether an earlier sponsored schedule mutation is visible at the provider. A
+    /// positive result is independently read back; `None` means it is not proven applied.
+    async fn verify_sponsored_subscription_update(
+        &self,
+        _subscription_id: &str,
+        _expected_period_start: i64,
+        _expected_period_end: i64,
+        _phases: &[SponsoredSubscriptionPhase],
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        Ok(None)
     }
 
     /// Schedule a personal subscription's founding-to-standard transition without adding
@@ -1328,6 +1304,23 @@ impl SubscriptionProvider for StripeBilling {
         personal_checkout_status_from_object(&value, session_id, operation_id)
     }
 
+    async fn get_sponsored_checkout_status(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        if session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("checkout/sessions/{session_id}"),
+        )
+        .await?;
+        checkout_status_from_object(&value, session_id, &format!("sponsored:{operation_id}"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_sponsored_checkout(
         &self,
@@ -1562,6 +1555,90 @@ impl SubscriptionProvider for StripeBilling {
             return Err(ProviderError::malformed_response());
         }
         self.get_sponsored_subscription(subscription_id).await
+    }
+
+    async fn verify_sponsored_subscription_update(
+        &self,
+        subscription_id: &str,
+        expected_period_start: i64,
+        expected_period_end: i64,
+        phases: &[SponsoredSubscriptionPhase],
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        if current.current_period_start != Some(expected_period_start)
+            || current.current_period_end != Some(expected_period_end)
+        {
+            return Ok(None);
+        }
+        let Some(schedule_id) = current.schedule_id.as_deref() else {
+            return Ok(None);
+        };
+        let schedule = stripe_get(
+            &self.api_key,
+            &format!("subscription_schedules/{schedule_id}"),
+        )
+        .await?;
+        let phase_at_end = phases
+            .iter()
+            .find(|phase| {
+                phase.start_at_epoch <= expected_period_end
+                    && phase
+                        .end_at_epoch
+                        .is_none_or(|end| expected_period_end < end)
+            })
+            .or_else(|| {
+                phases
+                    .iter()
+                    .find(|phase| phase.start_at_epoch == expected_period_end)
+            })
+            .ok_or_else(ProviderError::malformed_response)?;
+        let mut normalized = vec![SponsoredSubscriptionPhase {
+            start_at_epoch: expected_period_end,
+            end_at_epoch: phase_at_end.end_at_epoch,
+            items: phase_at_end.items.clone(),
+        }];
+        normalized.extend(
+            phases
+                .iter()
+                .filter(|phase| phase.start_at_epoch > expected_period_end)
+                .cloned(),
+        );
+        if normalized.windows(2).any(|window| {
+            window[0]
+                .end_at_epoch
+                .is_some_and(|end| end != window[1].start_at_epoch)
+        }) {
+            return Err(ProviderError::malformed_response());
+        }
+        let final_empty = normalized
+            .last()
+            .is_some_and(|phase| phase.items.is_empty());
+        if final_empty {
+            normalized.pop();
+        }
+        if normalized.iter().any(|phase| phase.items.is_empty()) {
+            return Err(ProviderError::malformed_response());
+        }
+        let current_start = stripe_current_schedule_phase_start(
+            &schedule,
+            schedule_id,
+            subscription_id,
+            expected_period_start,
+            expected_period_end,
+        )?;
+        if stripe_schedule_contains_phases(
+            &schedule,
+            current_start,
+            expected_period_end,
+            &current.items,
+            &normalized,
+        ) && schedule["end_behavior"].as_str()
+            == Some(if final_empty { "cancel" } else { "release" })
+        {
+            Ok(Some(current))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn get_sponsored_subscription(
@@ -2693,7 +2770,7 @@ async fn sponsored_checkout(
         sponsored_billing::begin_operation(&mut tx, &org_id, &user.user_id, &request, now)
             .await
             .map_err(Error::from)?;
-    if operation.state != "pending" {
+    if !matches!(operation.state.as_str(), "pending" | "unknown") {
         tx.rollback().await?;
         return Ok(Json(SponsoredOperationView {
             operation_id: operation.operation_id,
@@ -2789,126 +2866,94 @@ async fn sponsored_checkout(
     }
     tx.commit().await?;
 
-    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let result = if let Some((customer_id, Some(subscription_id), _)) = existing_subscription {
-        let phases = sponsored_provider_phases(
-            &state.pool,
-            &org_id,
-            catalogue,
-            sponsored_billing::current_epoch(),
-        )
-        .await?;
-        let snapshot = match billing
-            .provider
-            .update_sponsored_subscription(
-                &org_id,
-                &subscription_id,
-                &phases,
-                &operation.provider_idempotency_key,
-            )
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                if provider_failure_is_definitive(&error) {
-                    fail_sponsored_provider_operation(
-                        &state.pool,
-                        &operation.operation_id,
-                        "provider_rejected",
-                    )
-                    .await?;
-                } else if error.kind == ProviderErrorKind::Retryable {
-                    rotate_sponsored_provider_retry_key(
-                        &state.pool,
-                        &operation.operation_id,
-                        &operation.provider_idempotency_key,
-                    )
-                    .await?;
-                }
-                return Err(error.into_error());
-            }
-        };
-        let mut result_tx = state.pool.begin().await?;
-        let operation = sponsored_billing::record_provider_update(
-            &mut result_tx,
-            &operation.operation_id,
-            customer_id.as_deref().or(snapshot.customer_id.as_deref()),
-            &subscription_id,
-            snapshot.schedule_id.as_deref(),
-            snapshot.current_period_end,
-            None,
-        )
-        .await
-        .map_err(Error::from)?;
-        crate::notifications::enqueue_sponsorship_change_in_tx(
-            &mut result_tx,
-            &operation.operation_id,
-        )
-        .await
-        .map_err(notification_error)?;
-        result_tx.commit().await?;
-        SponsoredOperationView {
-            operation_id: operation.operation_id,
-            action: operation.action.as_str().into(),
-            state: operation.state,
-            provider_checkout_url: operation.provider_checkout_url,
+    let provider_request = if let Some(value) = operation.provider_request.clone() {
+        if operation.provider_request_version != Some(1) {
+            return Err(Error::Conflict(
+                "sponsored billing operation needs recovery review".into(),
+            ));
         }
-    } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
-        let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
-        let checkout = match billing
-            .provider
-            .create_sponsored_checkout(
+        serde_json::from_value::<sponsored_billing::SponsoredProviderRequest>(value)
+            .map_err(|_| Error::Internal("saved sponsored provider request is invalid".into()))?
+    } else if operation.state == "pending" {
+        let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+        if let Some((_, Some(subscription_id), _)) = existing_subscription.as_ref() {
+            let phases = sponsored_provider_phases(
+                &state.pool,
                 &org_id,
-                existing_customer.as_deref(),
-                &items,
-                &operation.operation_id,
-                &operation.provider_idempotency_key,
-                personal_checkout_expiry(
+                catalogue,
+                sponsored_billing::current_epoch(),
+            )
+            .await?;
+            let snapshot = billing
+                .provider
+                .get_sponsored_subscription(subscription_id)
+                .await
+                .map_err(ProviderError::into_error)?;
+            if snapshot.subscription_id != *subscription_id {
+                return Err(Error::Conflict(
+                    "sponsored subscription binding changed; operation needs review".into(),
+                ));
+            }
+            sponsored_billing::SponsoredProviderRequest::ScheduleUpdate {
+                organization_id: org_id.clone(),
+                subscription_id: subscription_id.clone(),
+                expected_period_start: snapshot.current_period_start.ok_or_else(|| {
+                    Error::Conflict("sponsored subscription period is unavailable".into())
+                })?,
+                expected_period_end: snapshot.current_period_end.ok_or_else(|| {
+                    Error::Conflict("sponsored subscription period is unavailable".into())
+                })?,
+                phases,
+            }
+        } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
+            sponsored_billing::SponsoredProviderRequest::Checkout {
+                organization_id: org_id.clone(),
+                customer_id: existing_customer.clone(),
+                items: sponsored_provider_items(&state.pool, &org_id, catalogue, &operation)
+                    .await?,
+                expires_at_epoch: personal_checkout_expiry(
                     operation.quote_expires_at_epoch,
                     sponsored_billing::current_epoch(),
                 )?,
-                &success_url,
-                &cancel_url,
-            )
-            .await
-        {
-            Ok(checkout) => checkout,
-            Err(error) => {
-                if provider_failure_is_definitive(&error) {
-                    fail_sponsored_provider_operation(
-                        &state.pool,
-                        &operation.operation_id,
-                        "provider_rejected",
-                    )
-                    .await?;
-                }
-                return Err(error.into_error());
+                success_url,
+                cancel_url,
             }
-        };
-        let mut result_tx = state.pool.begin().await?;
-        let operation = sponsored_billing::record_checkout(
-            &mut result_tx,
-            &operation.operation_id,
-            &checkout.checkout_url,
-            &checkout.session_id,
-            checkout.customer_id.as_deref(),
-            checkout.subscription_id.as_deref(),
-        )
-        .await
-        .map_err(Error::from)?;
-        result_tx.commit().await?;
-        SponsoredOperationView {
-            operation_id: operation.operation_id,
-            action: operation.action.as_str().into(),
-            state: operation.state,
-            provider_checkout_url: operation.provider_checkout_url,
+        } else {
+            return Err(Error::Conflict(
+                "sponsored subscription is missing for this change".into(),
+            ));
         }
     } else {
         return Err(Error::Conflict(
-            "sponsored subscription is missing for this change".into(),
+            "sponsored billing operation needs recovery review".into(),
         ));
     };
-    Ok(Json(result))
+    if operation.provider_request.is_none() {
+        let mut request_tx = state.pool.begin().await?;
+        sponsored_billing::persist_provider_request(
+            &mut request_tx,
+            &operation.operation_id,
+            &provider_request,
+        )
+        .await
+        .map_err(Error::from)?;
+        request_tx.commit().await?;
+    }
+    recover_sponsored_operation_by_id(&state.pool, billing, &operation.operation_id).await?;
+    let operation = sponsored_billing::load_operation_for_actor(
+        &state.pool,
+        &operation.operation_id,
+        &user.user_id,
+    )
+    .await
+    .map_err(Error::from)?
+    .ok_or_else(|| Error::NotFound("sponsored billing operation not found".into()))?;
+    Ok(Json(SponsoredOperationView {
+        operation_id: operation.operation_id,
+        action: operation.action.as_str().into(),
+        state: operation.state,
+        provider_checkout_url: operation.provider_checkout_url,
+    }))
 }
 
 async fn sponsored_operation(
@@ -3817,6 +3862,388 @@ pub async fn recover_personal_billing_operation_once(
         }
     }
     Ok(true)
+}
+
+/// Resolve one sponsored provider operation from its immutable request record. Provider writes
+/// are never made while a database transaction is open.
+pub async fn recover_sponsored_billing_operation_once(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+) -> Result<bool> {
+    if sponsored_billing::park_unprepared_legacy_operations(pool, 8).await? > 0 {
+        return Ok(true);
+    }
+    let Some(operation_id) = sponsored_billing::next_recovery_candidate(pool).await? else {
+        return Ok(false);
+    };
+    recover_sponsored_operation_by_id(pool, billing, &operation_id).await?;
+    Ok(true)
+}
+
+async fn recover_sponsored_operation_by_id(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    operation_id: &str,
+) -> Result<()> {
+    let lease_token = format!("sponsored-recovery:{}", uuid::Uuid::new_v4());
+    let Some(operation) = sponsored_billing::claim_recovery(pool, operation_id, &lease_token)
+        .await
+        .map_err(Error::from)?
+    else {
+        return Ok(());
+    };
+    let Some(request_value) = operation.provider_request.clone() else {
+        sponsored_billing::park_recovery_for_review(
+            pool,
+            &operation.operation_id,
+            &lease_token,
+            "provider_request_missing",
+        )
+        .await
+        .map_err(Error::from)?;
+        return Ok(());
+    };
+    if operation.provider_request_version != Some(1) {
+        sponsored_billing::park_recovery_for_review(
+            pool,
+            &operation.operation_id,
+            &lease_token,
+            "provider_request_version_unsupported",
+        )
+        .await
+        .map_err(Error::from)?;
+        return Ok(());
+    }
+    let request: sponsored_billing::SponsoredProviderRequest =
+        match serde_json::from_value(request_value) {
+            Ok(request) => request,
+            Err(_) => {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_request_invalid",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+        };
+    let now = sponsored_billing::current_epoch();
+    let first_sent = operation.provider_first_sent_epoch.unwrap_or(now);
+    let horizon_elapsed =
+        now.saturating_sub(first_sent) >= sponsored_billing::MAX_PROVIDER_REPLAY_SECONDS;
+
+    match request {
+        sponsored_billing::SponsoredProviderRequest::Checkout {
+            organization_id,
+            customer_id,
+            items,
+            expires_at_epoch,
+            success_url,
+            cancel_url,
+        } => {
+            if organization_id != operation.organization_id || items.is_empty() {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_request_binding_invalid",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+            if let Some(session_id) = operation.provider_checkout_session_id.as_deref() {
+                match billing
+                    .provider
+                    .get_sponsored_checkout_status(session_id, &operation.operation_id)
+                    .await
+                {
+                    Ok(PersonalCheckoutStatus::ExpiredUnpaid) => {
+                        let mut tx = pool.begin().await?;
+                        founding_allocator::lock_capacity(&mut tx)
+                            .await
+                            .map_err(|error| Error::Internal(error.to_string()))?;
+                        sponsored_billing::cancel_claimed_expired_checkout(
+                            &mut tx,
+                            &operation.operation_id,
+                            &lease_token,
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        tx.commit().await?;
+                    }
+                    Ok(PersonalCheckoutStatus::Open | PersonalCheckoutStatus::Complete) => {
+                        if horizon_elapsed {
+                            sponsored_billing::park_recovery_for_review(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                "checkout_settlement_unresolved",
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        } else {
+                            sponsored_billing::defer_recovery(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                if now < expires_at_epoch {
+                                    expires_at_epoch
+                                } else {
+                                    now.saturating_add(300)
+                                },
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                    }
+                    Err(error) => {
+                        sponsored_billing::record_recovery_failure(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            sponsored_recovery_error_code(&error),
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                    }
+                }
+                return Ok(());
+            }
+            if horizon_elapsed {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_idempotency_window_elapsed",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+            match billing
+                .provider
+                .create_sponsored_checkout(
+                    &organization_id,
+                    customer_id.as_deref(),
+                    &items,
+                    &operation.operation_id,
+                    &operation.provider_idempotency_key,
+                    expires_at_epoch,
+                    &success_url,
+                    &cancel_url,
+                )
+                .await
+            {
+                Ok(session) => {
+                    let mut tx = pool.begin().await?;
+                    sponsored_billing::record_claimed_checkout(
+                        &mut tx,
+                        &operation.operation_id,
+                        &lease_token,
+                        &session.checkout_url,
+                        &session.session_id,
+                        session.customer_id.as_deref(),
+                        session.subscription_id.as_deref(),
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    tx.commit().await?;
+                }
+                Err(error) => {
+                    record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                        .await?;
+                }
+            }
+        }
+        sponsored_billing::SponsoredProviderRequest::ScheduleUpdate {
+            organization_id,
+            subscription_id,
+            expected_period_start,
+            expected_period_end,
+            phases,
+        } => {
+            if organization_id != operation.organization_id
+                || Some(&subscription_id) != operation.provider_subscription_id.as_ref()
+                || phases.is_empty()
+            {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_request_binding_invalid",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+            if operation.state == "unknown" || operation.recovery_attempt_count > 0 {
+                match billing
+                    .provider
+                    .verify_sponsored_subscription_update(
+                        &subscription_id,
+                        expected_period_start,
+                        expected_period_end,
+                        &phases,
+                    )
+                    .await
+                {
+                    Ok(Some(snapshot)) => {
+                        record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
+                            .await?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        sponsored_billing::record_recovery_failure(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            sponsored_recovery_error_code(&error),
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        return Ok(());
+                    }
+                }
+            }
+            match billing
+                .provider
+                .get_sponsored_subscription(&subscription_id)
+                .await
+            {
+                Ok(snapshot)
+                    if snapshot.current_period_start == Some(expected_period_start)
+                        && snapshot.current_period_end == Some(expected_period_end) => {}
+                Ok(_) => {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "subscription_period_changed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                        .await?;
+                    return Ok(());
+                }
+            }
+            if horizon_elapsed {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_idempotency_window_elapsed",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+            match billing
+                .provider
+                .update_sponsored_subscription(
+                    &organization_id,
+                    &subscription_id,
+                    &phases,
+                    &operation.provider_idempotency_key,
+                )
+                .await
+            {
+                Ok(snapshot) => {
+                    record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
+                        .await?;
+                }
+                Err(error) => {
+                    record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                        .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn record_claimed_sponsored_update(
+    pool: &sqlx::PgPool,
+    operation: &sponsored_billing::SponsoredOperation,
+    lease_token: &str,
+    snapshot: &SponsoredSubscriptionSnapshot,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    sponsored_billing::record_claimed_provider_update(
+        &mut tx,
+        &operation.operation_id,
+        lease_token,
+        snapshot
+            .customer_id
+            .as_deref()
+            .or(operation.provider_customer_id.as_deref()),
+        &snapshot.subscription_id,
+        snapshot.schedule_id.as_deref(),
+        snapshot.current_period_end,
+        None,
+    )
+    .await
+    .map_err(Error::from)?;
+    crate::notifications::enqueue_sponsorship_change_in_tx(&mut tx, &operation.operation_id)
+        .await
+        .map_err(notification_error)?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn record_sponsored_provider_failure(
+    pool: &sqlx::PgPool,
+    operation: &sponsored_billing::SponsoredOperation,
+    lease_token: &str,
+    error: &ProviderError,
+) -> Result<()> {
+    if operation.state == "pending"
+        && operation.recovery_attempt_count == 0
+        && provider_failure_is_definitive(error)
+    {
+        let mut tx = pool.begin().await?;
+        founding_allocator::lock_capacity(&mut tx)
+            .await
+            .map_err(|failure| Error::Internal(failure.to_string()))?;
+        sponsored_billing::cancel_claimed_rejected_operation(
+            &mut tx,
+            &operation.operation_id,
+            lease_token,
+            "provider_rejected",
+        )
+        .await
+        .map_err(Error::from)?;
+        tx.commit().await?;
+    } else {
+        sponsored_billing::record_recovery_failure(
+            pool,
+            &operation.operation_id,
+            lease_token,
+            sponsored_recovery_error_code(error),
+        )
+        .await
+        .map_err(Error::from)?;
+    }
+    Ok(())
+}
+
+fn sponsored_recovery_error_code(error: &ProviderError) -> &'static str {
+    match error.kind {
+        ProviderErrorKind::Authentication => "provider_authentication",
+        ProviderErrorKind::ResourceMissing => "provider_resource_missing",
+        ProviderErrorKind::Retryable => "provider_retryable",
+        ProviderErrorKind::Unknown => "provider_unknown",
+    }
 }
 
 /// Reconcile an expired local pending account against Stripe's current session state. This also
@@ -4964,11 +5391,22 @@ fn personal_checkout_status_from_object(
     expected_session_id: &str,
     expected_operation_id: &str,
 ) -> ProviderResult<PersonalCheckoutStatus> {
+    checkout_status_from_object(
+        object,
+        expected_session_id,
+        &format!("personal:{expected_operation_id}"),
+    )
+}
+
+fn checkout_status_from_object(
+    object: &serde_json::Value,
+    expected_session_id: &str,
+    expected_client_reference_id: &str,
+) -> ProviderResult<PersonalCheckoutStatus> {
     if object["object"].as_str() != Some("checkout.session")
         || object["id"].as_str() != Some(expected_session_id)
         || object["mode"].as_str() != Some("subscription")
-        || object["client_reference_id"].as_str()
-            != Some(format!("personal:{expected_operation_id}").as_str())
+        || object["client_reference_id"].as_str() != Some(expected_client_reference_id)
     {
         return Err(ProviderError::malformed_response());
     }
@@ -11214,6 +11652,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Mutex;
     use tokio::net::TcpListener;
+    use uuid::Uuid;
 
     #[derive(Clone)]
     struct PreviewHttpState {
@@ -14035,6 +14474,27 @@ mod tests {
             personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
                 .unwrap(),
             PersonalCheckoutStatus::Complete
+        );
+    }
+
+    #[test]
+    fn sponsored_checkout_status_requires_its_operation_binding() {
+        let expired = serde_json::json!({
+            "object": "checkout.session",
+            "id": "cs_sponsored",
+            "mode": "subscription",
+            "client_reference_id": "sponsored:sponsored:operation",
+            "status": "expired",
+            "payment_status": "unpaid"
+        });
+        assert_eq!(
+            checkout_status_from_object(&expired, "cs_sponsored", "sponsored:sponsored:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::ExpiredUnpaid
+        );
+        assert!(
+            checkout_status_from_object(&expired, "cs_sponsored", "sponsored:other-operation")
+                .is_err()
         );
     }
 
