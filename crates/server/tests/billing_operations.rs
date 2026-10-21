@@ -575,15 +575,6 @@ async fn locally_expired_personal_checkout_is_reconciled_from_legacy_checkout_ur
     )
     .await
     .expect("persist personal account");
-    record_personal_checkout_request(
-        &mut tx,
-        &operation.operation_id,
-        "price_original_monthly",
-        "https://app.sotto.test/app?billing=success",
-        "https://app.sotto.test/app?billing=cancelled",
-    )
-    .await
-    .expect("persist provider request");
     record_provider_result(
         &mut tx,
         &operation.operation_id,
@@ -593,6 +584,7 @@ async fn locally_expired_personal_checkout_is_reconciled_from_legacy_checkout_ur
     )
     .await
     .expect("persist pre-migration checkout result");
+    // Older releases stored only the Checkout URL, not an explicit session id or request facts.
     sqlx::query("UPDATE billing_operations SET provider_checkout_url = $2 WHERE operation_id = $1")
         .bind(&operation.operation_id)
         .bind("https://checkout.stripe.com/c/pay/cs_legacy_expired")
