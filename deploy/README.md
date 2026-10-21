@@ -1277,12 +1277,14 @@ creation from the stored offer, allocation, expiry and original Stripe idempoten
 creates or reopens the same Checkout session; payment and coverage still require the signed
 `invoice.paid` webhook. Retries stop before Stripe's documented idempotency-key pruning window, and
 ambiguous older operations are parked for review. The worker also checks Stripe's current status
-for locally expired pending personal accounts with a stored Checkout session id (including the
-legacy `provider_operation_id` binding), and releases the account only when the exact personal
-session is confirmed expired and unpaid. This repairs missed or previously acknowledged expiry
-events; an open or completed session is never released by this check. This switch does not enable
-sales. Sponsored operation and refund recovery remain on their existing paths until their recovery
-workers are implemented and separately verified.
+for locally expired pending personal accounts with a stored Checkout session id. For older rows
+that contain only the Checkout URL, it extracts the session id from the URL path; it also accepts
+`provider_operation_id` when that field actually contains a Checkout session id. Stripe's response
+must confirm the exact personal operation before the account is released, and the session must be
+expired and unpaid. This repairs missed or previously acknowledged expiry events; an open or
+completed session is never released by this check. This switch does not enable sales. Sponsored
+operation and refund recovery remain on their existing paths until their recovery workers are
+implemented and separately verified.
 
 For a parked personal Checkout with no session id, do not clear the account because its local
 deadline elapsed. Check Stripe's event log and the customer's Checkout/subscription/payment history
