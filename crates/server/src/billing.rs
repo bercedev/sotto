@@ -1541,8 +1541,9 @@ impl SubscriptionProvider for StripeBilling {
             &schedule_update_idempotency_key(idempotency_key, &normalized),
         )
         .await?;
-        let schedule = stripe_get(
+        let schedule = stripe_get_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
@@ -1574,8 +1575,9 @@ impl SubscriptionProvider for StripeBilling {
         let Some(schedule_id) = current.schedule_id.as_deref() else {
             return Ok(None);
         };
-        let schedule = stripe_get(
+        let schedule = stripe_get_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
@@ -2940,7 +2942,8 @@ async fn sponsored_checkout(
         .map_err(Error::from)?;
         request_tx.commit().await?;
     }
-    recover_sponsored_operation_by_id(&state.pool, billing, &operation.operation_id).await?;
+    recover_sponsored_billing_operation_by_id(&state.pool, billing, &operation.operation_id)
+        .await?;
     let operation = sponsored_billing::load_operation_for_actor(
         &state.pool,
         &operation.operation_id,
@@ -3877,11 +3880,12 @@ pub async fn recover_sponsored_billing_operation_once(
     let Some(operation_id) = sponsored_billing::next_recovery_candidate(pool).await? else {
         return Ok(false);
     };
-    recover_sponsored_operation_by_id(pool, billing, &operation_id).await?;
+    recover_sponsored_billing_operation_by_id(pool, billing, &operation_id).await?;
     Ok(true)
 }
 
-async fn recover_sponsored_operation_by_id(
+#[doc(hidden)]
+pub async fn recover_sponsored_billing_operation_by_id(
     pool: &sqlx::PgPool,
     billing: &BillingState,
     operation_id: &str,
@@ -11715,6 +11719,8 @@ mod tests {
     struct SponsoredCheckoutHttpState {
         requests: CapturedSponsoredCheckoutRequests,
         calls: Arc<AtomicUsize>,
+        accepted_keys: Arc<Mutex<HashSet<String>>>,
+        remote_creations: Arc<AtomicUsize>,
     }
 
     async fn sponsored_checkout_http_mock(
@@ -11734,9 +11740,18 @@ mod tests {
             .lock()
             .expect("sponsored Checkout request lock")
             .push((
-                idempotency_key,
+                idempotency_key.clone(),
                 String::from_utf8(body.to_vec()).expect("form body is UTF-8"),
             ));
+        if let Some(key) = idempotency_key.as_ref() {
+            let mut accepted_keys = state
+                .accepted_keys
+                .lock()
+                .expect("accepted Checkout idempotency keys");
+            if accepted_keys.insert(key.clone()) {
+                state.remote_creations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         if state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -11758,6 +11773,7 @@ mod tests {
     async fn sponsored_checkout_http_server() -> (
         String,
         CapturedSponsoredCheckoutRequests,
+        Arc<AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -11767,9 +11783,12 @@ mod tests {
             .local_addr()
             .expect("sponsored Checkout mock address");
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let remote_creations = Arc::new(AtomicUsize::new(0));
         let state = SponsoredCheckoutHttpState {
             requests: requests.clone(),
             calls: Arc::new(AtomicUsize::new(0)),
+            accepted_keys: Arc::new(Mutex::new(HashSet::new())),
+            remote_creations: remote_creations.clone(),
         };
         let app = axum::Router::new()
             .route(
@@ -11781,6 +11800,87 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve sponsored Checkout mock");
+        });
+        (
+            format!("http://{address}"),
+            requests,
+            remote_creations,
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct SponsoredScheduleVerificationHttpState {
+        subscription: serde_json::Value,
+        schedule: serde_json::Value,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn sponsored_schedule_verification_http_mock(
+        State(state): State<SponsoredScheduleVerificationHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let path = request.uri().path().to_owned();
+        state
+            .requests
+            .lock()
+            .expect("schedule verification request lock")
+            .push(path.clone());
+        match path.as_str() {
+            "/v1/subscriptions/sub_recovery_http" => axum::Json(state.subscription).into_response(),
+            "/v1/subscription_schedules/sched_recovery_http" => {
+                axum::Json(state.schedule).into_response()
+            }
+            _ => (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "error": {"type": "invalid_request_error", "code": "resource_missing"}
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn sponsored_schedule_verification_http_server(
+        schedule: serde_json::Value,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sponsored schedule verification mock");
+        let address = listener
+            .local_addr()
+            .expect("sponsored schedule verification mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = SponsoredScheduleVerificationHttpState {
+            subscription: serde_json::json!({
+                "id": "sub_recovery_http",
+                "object": "subscription",
+                "customer": "cus_recovery_http",
+                "status": "active",
+                "cancel_at_period_end": false,
+                "cancel_at": null,
+                "default_payment_method": "pm_recovery_http",
+                "schedule": "sched_recovery_http",
+                "items": {"data": [{
+                    "id": "si_recovery_http",
+                    "price": {"id": "price_current_http"},
+                    "quantity": 1,
+                    "current_period_start": 1_600_000_000_i64,
+                    "current_period_end": 1_700_000_000_i64
+                }]}
+            }),
+            schedule,
+            requests: requests.clone(),
+        };
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(
+                sponsored_schedule_verification_http_mock,
+            ))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sponsored schedule verification mock");
         });
         (format!("http://{address}"), requests, server)
     }
@@ -14199,7 +14299,7 @@ mod tests {
 
     #[tokio::test]
     async fn sponsored_checkout_retry_reuses_the_exact_http_request_and_idempotency_key() {
-        let (origin, requests, server) = sponsored_checkout_http_server().await;
+        let (origin, requests, remote_creations, server) = sponsored_checkout_http_server().await;
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_legacy_unused".into(),
@@ -14259,7 +14359,124 @@ mod tests {
             .1
             .contains("line_items%5B0%5D%5Bprice%5D=price_recovery_monthly"));
         assert!(requests[0].1.contains("line_items%5B0%5D%5Bquantity%5D=2"));
+        assert_eq!(
+            remote_creations.load(Ordering::SeqCst),
+            1,
+            "the HTTP mock accepted only one remote Checkout despite losing the first response"
+        );
         drop(requests);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sponsored_schedule_recovery_verifies_provider_binding_and_exact_saved_items_over_http()
+    {
+        let schedule = |subscription_id: &str, future_price: &str| {
+            serde_json::json!({
+                "id": "sched_recovery_http",
+                "object": "subscription_schedule",
+                "subscription": subscription_id,
+                "end_behavior": "release",
+                "current_phase": {
+                    "start_date": 1_600_000_000_i64,
+                    "end_date": 1_700_000_000_i64
+                },
+                "phases": [
+                    {
+                        "start_date": 1_600_000_000_i64,
+                        "end_date": 1_700_000_000_i64,
+                        "items": [{"price": "price_current_http", "quantity": 1}]
+                    },
+                    {
+                        "start_date": 1_700_000_000_i64,
+                        "end_date": 1_800_000_000_i64,
+                        "items": [{"price": future_price, "quantity": 2}]
+                    }
+                ]
+            })
+        };
+        let expected = [SponsoredSubscriptionPhase {
+            start_at_epoch: 1_700_000_000,
+            end_at_epoch: None,
+            items: vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_recovery_http".into(),
+                quantity: 2,
+            }],
+        }];
+
+        let (origin, requests, server) = sponsored_schedule_verification_http_server(schedule(
+            "sub_recovery_http",
+            "price_recovery_http",
+        ))
+        .await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            api_origin: origin,
+        };
+        let verified = provider
+            .verify_sponsored_subscription_update(
+                "sub_recovery_http",
+                1_600_000_000,
+                1_700_000_000,
+                &expected,
+            )
+            .await
+            .expect("read and validate accepted schedule");
+        assert!(verified.is_some());
+        assert_eq!(
+            requests
+                .lock()
+                .expect("read verification requests")
+                .as_slice(),
+            [
+                "/v1/subscriptions/sub_recovery_http",
+                "/v1/subscription_schedules/sched_recovery_http"
+            ]
+        );
+        server.abort();
+
+        let (origin, _, server) = sponsored_schedule_verification_http_server(schedule(
+            "sub_recovery_http",
+            "price_unexpected_http",
+        ))
+        .await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            api_origin: origin,
+        };
+        let mismatched_item = provider
+            .verify_sponsored_subscription_update(
+                "sub_recovery_http",
+                1_600_000_000,
+                1_700_000_000,
+                &expected,
+            )
+            .await
+            .expect("a valid but different schedule is not a read error");
+        assert!(mismatched_item.is_none());
+        server.abort();
+
+        let (origin, _, server) = sponsored_schedule_verification_http_server(schedule(
+            "sub_other_http",
+            "price_recovery_http",
+        ))
+        .await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            api_origin: origin,
+        };
+        assert!(provider
+            .verify_sponsored_subscription_update(
+                "sub_recovery_http",
+                1_600_000_000,
+                1_700_000_000,
+                &expected,
+            )
+            .await
+            .is_err());
         server.abort();
     }
 

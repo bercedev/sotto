@@ -16,9 +16,9 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use async_trait::async_trait;
 use sotto_server::billing::{
-    recover_sponsored_billing_operation_once, BillingState, ProviderError, ProviderErrorKind,
-    ProviderResult, SponsoredCheckoutSession, SponsoredSubscriptionItemRequest,
-    SubscriptionObservation, SubscriptionProvider,
+    recover_sponsored_billing_operation_by_id, recover_sponsored_billing_operation_once,
+    BillingState, ProviderError, ProviderErrorKind, ProviderResult, SponsoredCheckoutSession,
+    SponsoredSubscriptionItemRequest, SubscriptionObservation, SubscriptionProvider,
 };
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
@@ -33,6 +33,8 @@ struct LostResponseProvider {
     customer_id: String,
     session_id: String,
     calls: AtomicUsize,
+    remote_creations: AtomicUsize,
+    accepted_sessions: Mutex<std::collections::HashMap<String, SponsoredCheckoutSession>>,
     idempotency_keys: Mutex<Vec<String>>,
     first_call_started: Notify,
     release_first_call: Notify,
@@ -54,6 +56,8 @@ impl LostResponseProvider {
             customer_id,
             session_id,
             calls: AtomicUsize::new(0),
+            remote_creations: AtomicUsize::new(0),
+            accepted_sessions: Mutex::new(std::collections::HashMap::new()),
             idempotency_keys: Mutex::new(Vec::new()),
             first_call_started: Notify::new(),
             release_first_call: Notify::new(),
@@ -109,12 +113,36 @@ impl SubscriptionProvider for LostResponseProvider {
         _success_url: &str,
         _cancel_url: &str,
     ) -> ProviderResult<SponsoredCheckoutSession> {
+        let accepted = SponsoredCheckoutSession {
+            session_id: self.session_id.clone(),
+            checkout_url: format!("https://checkout.stripe.test/{}", self.session_id),
+            customer_id: Some(self.customer_id.clone()),
+            subscription_id: None,
+        };
+        let previous = self
+            .accepted_sessions
+            .lock()
+            .expect("accepted provider session lock")
+            .get(idempotency_key)
+            .cloned();
+        if let Some(session) = previous {
+            self.idempotency_keys
+                .lock()
+                .expect("idempotency key lock")
+                .push(idempotency_key.to_owned());
+            return Ok(session.clone());
+        }
         self.idempotency_keys
             .lock()
             .expect("idempotency key lock")
             .push(idempotency_key.to_owned());
         match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => {
+                self.accepted_sessions
+                    .lock()
+                    .expect("accepted provider session lock")
+                    .insert(idempotency_key.to_owned(), accepted);
+                self.remote_creations.fetch_add(1, Ordering::SeqCst);
                 self.first_call_started.notify_one();
                 self.release_first_call.notified().await;
                 Err(ProviderError {
@@ -123,12 +151,16 @@ impl SubscriptionProvider for LostResponseProvider {
                     kind: ProviderErrorKind::Retryable,
                 })
             }
-            _ => Ok(SponsoredCheckoutSession {
-                session_id: self.session_id.clone(),
-                checkout_url: format!("https://checkout.stripe.test/{}", self.session_id),
-                customer_id: Some(self.customer_id.clone()),
-                subscription_id: None,
-            }),
+            _ => {
+                // The simulated provider has accepted the first request. Returning its stored
+                // result for the same key proves the retry does not create a second Checkout.
+                self.accepted_sessions
+                    .lock()
+                    .expect("accepted provider session lock")
+                    .insert(idempotency_key.to_owned(), accepted.clone());
+                self.remote_creations.fetch_add(1, Ordering::SeqCst);
+                Ok(accepted)
+            }
         }
     }
 }
@@ -924,7 +956,8 @@ async fn sponsored_recovery_replays_immutable_request_under_a_fenced_lease() {
 }
 
 #[tokio::test]
-async fn sponsored_recovery_replays_same_checkout_after_lost_response_and_serialises_workers() {
+async fn sponsored_recovery_replays_accepted_checkout_after_response_loss_and_serialises_caller_with_worker(
+) {
     let _guard = TEST_LOCK.lock().await;
     let Some(pool) = pool().await else {
         return;
@@ -953,11 +986,12 @@ async fn sponsored_recovery_replays_same_checkout_after_lost_response_and_serial
     .expect("first provider call started while holding the recovery lease");
 
     assert!(
-        !recover_sponsored_billing_operation_once(&pool, &billing)
+        recover_sponsored_billing_operation_by_id(&pool, &billing, &fixture.operation_id)
             .await
-            .expect("second worker sees the active lease"),
-        "a second worker must not send the same provider operation concurrently"
+            .is_ok(),
+        "the original caller may retry while the worker owns the lease"
     );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     provider.release_first_call.notify_one();
     assert!(first_worker
         .await
@@ -1004,6 +1038,11 @@ async fn sponsored_recovery_replays_same_checkout_after_lost_response_and_serial
         .clone();
     assert_eq!(keys.len(), 2);
     assert_eq!(keys[0], keys[1], "recovery must replay the stored key");
+    assert_eq!(
+        provider.remote_creations.load(Ordering::SeqCst),
+        1,
+        "the provider accepted the first request before its response was lost, so the retry must not create a second Checkout"
+    );
 
     let (first_claim, second_claim) = tokio::join!(
         claim_recovery(&pool, &fixture.operation_id, "concurrent:one"),
