@@ -1282,9 +1282,15 @@ that contain only the Checkout URL, it extracts the session id from the URL path
 `provider_operation_id` when that field actually contains a Checkout session id. Stripe's response
 must confirm the exact personal operation before the account is released, and the session must be
 expired and unpaid. This repairs missed or previously acknowledged expiry events; an open or
-completed session is never released by this check. This switch does not enable sales. Sponsored
-operation and refund recovery remain on their existing paths until their recovery workers are
-implemented and separately verified.
+completed session is never released by this check. This switch does not enable sales.
+
+The default-off `SOTTO_SPONSORED_BILLING_RECOVERY_WORKER_ENABLED` reconciles saved sponsored
+Checkout and shared-subscription schedule requests. It reuses the exact saved request and original
+Stripe idempotency key, and parks missing, changed or out-of-window evidence for review. Signed
+payment webhooks remain authoritative for activating sponsored seats. This switch requires Cloud
+mode and the hosted Stripe price catalogue, and it does not enable sponsored sales or refund
+processing. Older unresolved operations without saved request facts are parked by migration 0071;
+do not reconstruct a provider request manually.
 
 For a parked personal Checkout with no session id, do not clear the account because its local
 deadline elapsed. Check Stripe's event log and the customer's Checkout/subscription/payment history
