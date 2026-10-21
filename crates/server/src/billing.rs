@@ -1371,8 +1371,9 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
-        let session = stripe_post_with_idempotency(
+        let session = stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             "checkout/sessions",
             &form,
             idempotency_key,
@@ -4079,34 +4080,32 @@ async fn recover_sponsored_operation_by_id(
                 .map_err(Error::from)?;
                 return Ok(());
             }
-            if operation.state == "unknown" || operation.recovery_attempt_count > 0 {
-                match billing
-                    .provider
-                    .verify_sponsored_subscription_update(
-                        &subscription_id,
-                        expected_period_start,
-                        expected_period_end,
-                        &phases,
+            match billing
+                .provider
+                .verify_sponsored_subscription_update(
+                    &subscription_id,
+                    expected_period_start,
+                    expected_period_end,
+                    &phases,
+                )
+                .await
+            {
+                Ok(Some(snapshot)) => {
+                    record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
+                        .await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    sponsored_billing::record_recovery_failure(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        sponsored_recovery_error_code(&error),
                     )
                     .await
-                {
-                    Ok(Some(snapshot)) => {
-                        record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
-                            .await?;
-                        return Ok(());
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        sponsored_billing::record_recovery_failure(
-                            pool,
-                            &operation.operation_id,
-                            &lease_token,
-                            sponsored_recovery_error_code(&error),
-                        )
-                        .await
-                        .map_err(Error::from)?;
-                        return Ok(());
-                    }
+                    .map_err(Error::from)?;
+                    return Ok(());
                 }
             }
             match billing
@@ -11650,6 +11649,7 @@ mod tests {
     use axum::response::IntoResponse;
     use std::collections::HashSet;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::net::TcpListener;
     use uuid::Uuid;
@@ -11707,6 +11707,82 @@ mod tests {
                 .expect("serve preview mock");
         });
         (format!("http://{address}"), request, server)
+    }
+
+    type CapturedSponsoredCheckoutRequests = Arc<Mutex<Vec<(Option<String>, String)>>>;
+
+    #[derive(Clone)]
+    struct SponsoredCheckoutHttpState {
+        requests: CapturedSponsoredCheckoutRequests,
+        calls: Arc<AtomicUsize>,
+    }
+
+    async fn sponsored_checkout_http_mock(
+        State(state): State<SponsoredCheckoutHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let idempotency_key = request
+            .headers()
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small sponsored Checkout request");
+        state
+            .requests
+            .lock()
+            .expect("sponsored Checkout request lock")
+            .push((
+                idempotency_key,
+                String::from_utf8(body.to_vec()).expect("form body is UTF-8"),
+            ));
+        if state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": {"type": "api_error", "code": "api_error"}
+                })),
+            )
+                .into_response();
+        }
+        axum::Json(serde_json::json!({
+            "id": "cs_recovered_http",
+            "url": "https://checkout.stripe.test/cs_recovered_http",
+            "customer": "cus_recovered_http",
+            "subscription": null
+        }))
+        .into_response()
+    }
+
+    async fn sponsored_checkout_http_server() -> (
+        String,
+        CapturedSponsoredCheckoutRequests,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sponsored Checkout mock");
+        let address = listener
+            .local_addr()
+            .expect("sponsored Checkout mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = SponsoredCheckoutHttpState {
+            requests: requests.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/checkout/sessions",
+                axum::routing::post(sponsored_checkout_http_mock),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sponsored Checkout mock");
+        });
+        (format!("http://{address}"), requests, server)
     }
 
     #[derive(Clone)]
@@ -14119,6 +14195,72 @@ mod tests {
         assert_eq!(headers.get("Stripe-Version").unwrap(), STRIPE_API_VERSION);
         assert_eq!(headers.get("Idempotency-Key").unwrap(), "operation-123");
         assert!(stripe_headers(Some("bad\nkey")).is_err());
+    }
+
+    #[tokio::test]
+    async fn sponsored_checkout_retry_reuses_the_exact_http_request_and_idempotency_key() {
+        let (origin, requests, server) = sponsored_checkout_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            api_origin: origin,
+        };
+        let items = vec![SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_recovery_monthly".into(),
+            quantity: 2,
+        }];
+        let first = provider
+            .create_sponsored_checkout(
+                "org_recovery",
+                Some("cus_recovery"),
+                &items,
+                "sponsored:operation_recovery",
+                "sotto-sponsored:stable-key",
+                1_800_000_000,
+                "https://app.example.test/success",
+                "https://app.example.test/cancel",
+            )
+            .await;
+        assert!(
+            matches!(
+                &first,
+                Err(ProviderError {
+                    kind: ProviderErrorKind::Retryable,
+                    ..
+                })
+            ),
+            "first provider response should be retryable: {first:?}"
+        );
+
+        let replay = provider
+            .create_sponsored_checkout(
+                "org_recovery",
+                Some("cus_recovery"),
+                &items,
+                "sponsored:operation_recovery",
+                "sotto-sponsored:stable-key",
+                1_800_000_000,
+                "https://app.example.test/success",
+                "https://app.example.test/cancel",
+            )
+            .await
+            .expect("same request succeeds after an ambiguous provider response");
+        assert_eq!(replay.session_id, "cs_recovered_http");
+
+        let requests = requests.lock().expect("read HTTP requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0.as_deref(), Some("sotto-sponsored:stable-key"));
+        assert_eq!(requests[1].0.as_deref(), Some("sotto-sponsored:stable-key"));
+        assert_eq!(requests[0].1, requests[1].1);
+        assert!(requests[0]
+            .1
+            .contains("subscription_data%5Bmetadata%5D%5Bsponsored_operation_id%5D=sponsored%3Aoperation_recovery"));
+        assert!(requests[0]
+            .1
+            .contains("line_items%5B0%5D%5Bprice%5D=price_recovery_monthly"));
+        assert!(requests[0].1.contains("line_items%5B0%5D%5Bquantity%5D=2"));
+        drop(requests);
+        server.abort();
     }
 
     #[test]
