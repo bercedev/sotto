@@ -7,9 +7,9 @@ use sqlx::{postgres::PgConnectOptions, PgPool, Row};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::{timeout, Duration};
 
 use sotto_server::billing::{
@@ -26,6 +26,11 @@ use sotto_server::billing_operations::{
 };
 use sotto_server::config::BillingPriceIds;
 use sotto_server::db;
+
+fn test_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
 
 async fn pool_or_skip() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -205,6 +210,7 @@ async fn cleanup_organization(pool: &PgPool, organization_id: &str) {
 
 #[tokio::test]
 async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -274,6 +280,7 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
 
 #[tokio::test]
 async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_session_id() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -424,6 +431,7 @@ async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_sess
 
 #[tokio::test]
 async fn refund_required_checkout_is_parked_without_another_provider_request() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -525,7 +533,8 @@ async fn refund_required_checkout_is_parked_without_another_provider_request() {
 }
 
 #[tokio::test]
-async fn locally_expired_personal_checkout_is_reconciled_from_legacy_session_id() {
+async fn locally_expired_personal_checkout_is_reconciled_from_legacy_checkout_url() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -572,11 +581,17 @@ async fn locally_expired_personal_checkout_is_reconciled_from_legacy_session_id(
         &mut tx,
         &operation.operation_id,
         BillingOperationState::Succeeded,
-        Some("cs_legacy_expired"),
+        None,
         Some("checkout_created"),
     )
     .await
-    .expect("persist pre-migration session binding");
+    .expect("persist pre-migration checkout result");
+    sqlx::query("UPDATE billing_operations SET provider_checkout_url = $2 WHERE operation_id = $1")
+        .bind(&operation.operation_id)
+        .bind("https://checkout.stripe.com/c/pay/cs_legacy_expired")
+        .execute(&mut *tx)
+        .await
+        .expect("persist legacy checkout URL containing the session id");
     sqlx::query(
         "UPDATE billing_personal_accounts SET pending_expires_at_epoch = \
          extract(epoch FROM now())::bigint - 60 WHERE operation_id = $1",
@@ -590,6 +605,7 @@ async fn locally_expired_personal_checkout_is_reconciled_from_legacy_session_id(
     let provider = RecoveryCheckoutProvider {
         calls: Arc::new(AtomicUsize::new(0)),
         received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        status_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         lose_first_response: false,
     };
     let billing_state = BillingState::with_provider(
@@ -622,11 +638,16 @@ async fn locally_expired_personal_checkout_is_reconciled_from_legacy_session_id(
     assert_eq!(operation_result.1, "checkout_expired");
     assert_eq!(operation_result.2.as_deref(), Some("cs_legacy_expired"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        provider.status_requests.lock().unwrap().as_slice(),
+        &[("cs_legacy_expired".into(), operation.operation_id.clone())]
+    );
     cleanup(&pool, USER_ID).await;
 }
 
 #[tokio::test]
 async fn verified_paid_invoice_resolves_recovery_lease_and_manual_review() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -721,6 +742,7 @@ async fn verified_paid_invoice_resolves_recovery_lease_and_manual_review() {
 
 #[tokio::test]
 async fn customer_retry_parks_checkout_after_provider_idempotency_window() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -785,6 +807,7 @@ async fn customer_retry_parks_checkout_after_provider_idempotency_window() {
 
 #[tokio::test]
 async fn signed_expiry_fences_a_late_recovery_result_before_account_reuse() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -919,6 +942,7 @@ async fn signed_expiry_fences_a_late_recovery_result_before_account_reuse() {
 
 #[tokio::test]
 async fn recovery_failure_budget_counts_failures_and_parks_at_twenty() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -1077,6 +1101,7 @@ impl BillingOperationProvider for SuccessfulProvider {
 
 #[tokio::test]
 async fn unknown_provider_result_is_reconciled_after_restart() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -1191,6 +1216,7 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
 
 #[tokio::test]
 async fn concurrent_recovery_claims_the_provider_call_once() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -1286,6 +1312,7 @@ async fn concurrent_recovery_claims_the_provider_call_once() {
 
 #[tokio::test]
 async fn organisation_operations_require_role_and_active_lifecycle() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };

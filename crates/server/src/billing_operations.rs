@@ -619,14 +619,19 @@ pub async fn record_checkout_expired(
                 .provider_checkout_session_id
                 .as_deref()
                 .is_none_or(|stored| stored == session_id)
-            && existing.provider_operation_id.as_deref() == Some(session_id)
+            && existing
+                .provider_operation_id
+                .as_deref()
+                .is_none_or(|stored| stored == session_id)
         {
             sqlx::query(
                 "UPDATE billing_operations SET state = 'failed', result_code = 'checkout_expired', \
+                 provider_operation_id = COALESCE(provider_operation_id, $2), \
                  provider_checkout_session_id = COALESCE(provider_checkout_session_id, $2), \
                  reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
                  WHERE operation_id = $1 AND state = 'succeeded' \
-                   AND result_code = 'checkout_created' AND provider_operation_id = $2 \
+                   AND result_code = 'checkout_created' \
+                   AND (provider_operation_id IS NULL OR provider_operation_id = $2) \
                    AND (provider_checkout_session_id IS NULL OR provider_checkout_session_id = $2)",
             )
             .bind(operation_id)
@@ -977,9 +982,9 @@ pub async fn load_personal_reconciliation_candidates(
     rows.into_iter().map(operation_from_row).collect()
 }
 
-/// Claim one locally expired pending personal account with a known Checkout session. The session
-/// identifier falls back to provider_operation_id for rows written before the dedicated column
-/// was introduced.
+/// Claim one locally expired pending personal account with a known Checkout session. Older
+/// rows stored only the provider Checkout URL, so the session identifier may need to be recovered
+/// from its path.
 pub async fn claim_expired_personal_checkout(
     pool: &PgPool,
     lease_token: &str,
@@ -991,7 +996,13 @@ pub async fn claim_expired_personal_checkout(
     let row = sqlx::query(
         "WITH candidate AS (\
            SELECT operation.operation_id, \
-                  COALESCE(operation.provider_checkout_session_id, operation.provider_operation_id) AS session_id \
+                  COALESCE(\
+                    CASE WHEN left(operation.provider_checkout_session_id, 3) = 'cs_' \
+                         THEN operation.provider_checkout_session_id END, \
+                    CASE WHEN left(operation.provider_operation_id, 3) = 'cs_' \
+                         THEN operation.provider_operation_id END, \
+                    substring(operation.provider_checkout_url FROM '/(cs_[A-Za-z0-9_]+)')\
+                  ) AS session_id \
            FROM billing_operations AS operation \
            JOIN billing_personal_accounts AS account USING (operation_id) \
            WHERE account.state = 'pending' \
@@ -999,8 +1010,13 @@ pub async fn claim_expired_personal_checkout(
              AND operation.payer_id = account.user_id \
              AND operation.beneficiary_id = account.user_id \
              AND operation.result_code IN ('checkout_created', 'provider_idempotency_window_elapsed') \
-             AND COALESCE(operation.provider_checkout_session_id, operation.provider_operation_id) IS NOT NULL \
-             AND left(COALESCE(operation.provider_checkout_session_id, operation.provider_operation_id), 3) = 'cs_' \
+             AND COALESCE(\
+                   CASE WHEN left(operation.provider_checkout_session_id, 3) = 'cs_' \
+                        THEN operation.provider_checkout_session_id END, \
+                   CASE WHEN left(operation.provider_operation_id, 3) = 'cs_' \
+                        THEN operation.provider_operation_id END, \
+                   substring(operation.provider_checkout_url FROM '/(cs_[A-Za-z0-9_]+)')\
+                 ) IS NOT NULL \
              AND ($2::text IS NULL OR account.user_id = $2) \
              AND operation.reconciliation_next_attempt_at <= now() \
              AND (operation.reconciliation_lease_until IS NULL OR operation.reconciliation_lease_until < now()) \
