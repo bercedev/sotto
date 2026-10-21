@@ -71,6 +71,7 @@ async fn cleanup(pool: &PgPool, user_id: &str) {
 struct RecoveryCheckoutProvider {
     calls: Arc<AtomicUsize>,
     received: Arc<std::sync::Mutex<Vec<CapturedCheckoutRequest>>>,
+    status_requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     lose_first_response: bool,
 }
 
@@ -132,9 +133,13 @@ impl SubscriptionProvider for RecoveryCheckoutProvider {
 
     async fn get_personal_checkout_status(
         &self,
-        _session_id: &str,
-        _operation_id: &str,
+        session_id: &str,
+        operation_id: &str,
     ) -> ProviderResult<PersonalCheckoutStatus> {
+        self.status_requests
+            .lock()
+            .unwrap()
+            .push((session_id.to_string(), operation_id.to_string()));
         Ok(PersonalCheckoutStatus::ExpiredUnpaid)
     }
 
@@ -337,6 +342,7 @@ async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_sess
     let provider = RecoveryCheckoutProvider {
         calls: Arc::new(AtomicUsize::new(0)),
         received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        status_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         lose_first_response: true,
     };
     let billing_state = BillingState::with_provider(
@@ -496,6 +502,7 @@ async fn refund_required_checkout_is_parked_without_another_provider_request() {
     let provider = RecoveryCheckoutProvider {
         calls: Arc::new(AtomicUsize::new(0)),
         received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        status_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         lose_first_response: false,
     };
     let billing_state = BillingState::with_provider(
