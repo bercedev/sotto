@@ -90,6 +90,7 @@ pub mod cloud_provider_stripe_sponsored_refresh;
 pub mod cloud_provider_stripe_sponsored_store;
 #[doc(hidden)]
 pub mod cloud_retention_lifecycle;
+pub mod cloud_shared_retention;
 pub mod community;
 pub mod config;
 pub mod contact_email;
@@ -130,6 +131,7 @@ pub mod server_info;
 pub mod share;
 #[doc(hidden)]
 pub mod sponsored_billing;
+pub mod sponsored_billing_recovery_executor;
 pub mod state;
 pub mod sync;
 pub mod telemetry;
@@ -174,6 +176,15 @@ pub fn app(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let cloud_retention_purge_ops = if state.cloud_retention_purge_enabled
+        && state.cloud_retention_destructive_token.is_some()
+        && state.cloud_retention_evidence_hmac_key.is_some()
+        && state.cloud_retention_build_sha.is_some()
+    {
+        retention_ops::purge_router()
+    } else {
+        Router::new()
+    };
     let cloud_notice_ops = if state.cloud_retention_operator_token.is_some() {
         notifications::operator_router()
     } else {
@@ -193,6 +204,7 @@ pub fn app(state: AppState) -> Router {
         .merge(billing_transfer_setup)
         .merge(billing_transfer_ops)
         .merge(cloud_retention_ops)
+        .merge(cloud_retention_purge_ops)
         .merge(cloud_notice_ops)
         .merge(if state.billing_transfer_operator_token.is_some() {
             founding_price_notices::operator_router()

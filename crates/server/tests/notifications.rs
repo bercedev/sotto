@@ -903,7 +903,12 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             billing_transfer_execution_enabled: false,
             billing_transfer_setup_enabled: false,
             cloud_retention_dry_run_enabled: false,
+            cloud_shared_retention_dry_run_enabled: false,
             cloud_retention_operator_token: None,
+            cloud_retention_purge_enabled: false,
+            cloud_retention_destructive_token: None,
+            cloud_retention_evidence_hmac_key: None,
+            cloud_retention_build_sha: None,
         });
     let response = app
         .clone()
@@ -1359,7 +1364,12 @@ async fn operator_notice_controls_are_redacted_bounded_and_audited() {
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
         cloud_retention_dry_run_enabled: false,
+        cloud_shared_retention_dry_run_enabled: false,
         cloud_retention_operator_token: Some("notice-operator-test-token".into()),
+        cloud_retention_purge_enabled: false,
+        cloud_retention_destructive_token: None,
+        cloud_retention_evidence_hmac_key: None,
+        cloud_retention_build_sha: None,
     };
     let app = sotto_server::app(state);
     let missing_auth = app

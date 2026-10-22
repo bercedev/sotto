@@ -59,7 +59,12 @@ fn app(pool: PgPool) -> axum::Router {
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
         cloud_retention_dry_run_enabled: false,
+        cloud_shared_retention_dry_run_enabled: false,
         cloud_retention_operator_token: None,
+        cloud_retention_purge_enabled: false,
+        cloud_retention_destructive_token: None,
+        cloud_retention_evidence_hmac_key: None,
+        cloud_retention_build_sha: None,
     })
 }
 

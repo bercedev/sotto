@@ -58,6 +58,16 @@ pub struct AppState {
     pub billing_transfer_setup_enabled: bool,
     /// Whether the dormant Cloud retention candidate and dry-run worker is started.
     pub cloud_retention_dry_run_enabled: bool,
+    /// Whether the shared organisation retention scanner and dry-run worker is started.
+    pub cloud_shared_retention_dry_run_enabled: bool,
     /// Dedicated bearer token for Cloud retention operator routes.
     pub cloud_retention_operator_token: Option<String>,
+    /// Whether a separately approved, bounded Cloud retention purge worker is active.
+    pub cloud_retention_purge_enabled: bool,
+    /// Destructive credential, independent from protected inspection controls.
+    pub cloud_retention_destructive_token: Option<String>,
+    /// HMAC key used to verify the protected restore evidence attestation.
+    pub cloud_retention_evidence_hmac_key: Option<String>,
+    /// Release identity bound to verified restore evidence.
+    pub cloud_retention_build_sha: Option<String>,
 }

@@ -258,7 +258,12 @@ async fn run() -> Result<()> {
         billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
         billing_transfer_setup_enabled: config.billing_transfer_setup_enabled,
         cloud_retention_dry_run_enabled: config.cloud_retention_dry_run_enabled,
+        cloud_shared_retention_dry_run_enabled: config.cloud_shared_retention_dry_run_enabled,
         cloud_retention_operator_token: config.cloud_retention_operator_token.clone(),
+        cloud_retention_purge_enabled: config.cloud_retention_purge_enabled,
+        cloud_retention_destructive_token: config.cloud_retention_destructive_token.clone(),
+        cloud_retention_evidence_hmac_key: config.cloud_retention_evidence_hmac_key.clone(),
+        cloud_retention_build_sha: config.cloud_retention_build_sha.clone(),
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
@@ -275,6 +280,10 @@ async fn run() -> Result<()> {
     println!(
         "Cloud billing recovery worker: {}",
         config.billing_recovery_worker_enabled
+    );
+    println!(
+        "Sponsored billing recovery worker: {}",
+        config.sponsored_billing_recovery_worker_enabled
     );
     println!(
         "provider refresh: ingest={}, worker={}, reconciliation={}",
@@ -330,6 +339,10 @@ async fn run() -> Result<()> {
         "Cloud personal retention dry run: {}",
         config.cloud_retention_dry_run_enabled
     );
+    println!(
+        "Cloud shared organisation retention dry run: {}",
+        config.cloud_shared_retention_dry_run_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
@@ -347,7 +360,15 @@ async fn run() -> Result<()> {
         })?;
         sotto_server::billing_recovery_executor::spawn(pool.clone(), billing);
     }
-    if config.cloud_retention_dry_run_enabled {
+    if config.sponsored_billing_recovery_worker_enabled {
+        let billing = state.billing.clone().ok_or_else(|| {
+            Error::Config(
+                "sponsored billing recovery worker requires configured Stripe billing".into(),
+            )
+        })?;
+        sotto_server::sponsored_billing_recovery_executor::spawn(pool.clone(), billing);
+    }
+    if config.cloud_retention_dry_run_enabled || config.cloud_shared_retention_dry_run_enabled {
         sotto_server::cloud_retention_lifecycle::spawn(state.clone());
     }
     if config.founding_schedule_worker_enabled {
